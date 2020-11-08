@@ -1,7 +1,17 @@
 on:
   ControlRequest:
     - !ControlReqDriver {}
-  SearchRequest:
-    - !ChunkPruneDriver {}  # embedding info on chunk is used and no need anymore
-    - !Chunk2DocRankDriver {}
-    - !TopKFilterDriver {}
+  [SearchRequest]:
+    - !ExcludeQL
+      with:
+        fields:
+          - embedding
+    - !SortQL
+      with:
+        field: 'score__value'
+        traversal_paths: ['m']
+    - !SliceQL
+      with:
+        traversal_paths: ['m']
+        start: 0
+        end: 50

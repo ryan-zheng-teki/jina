@@ -1,7 +1,7 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 
@@ -31,13 +31,10 @@ class Chunk2DocRanker(BaseRanker):
     """
 
     required_keys = {'text'}  #: a set of ``str``, key-values to extracted from the chunk-level protobuf message
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.col_doc_id = 0
-        self.col_chunk_id = 1
-        self.col_query_chunk_id = 2
-        self.col_score = 3
+    COL_MATCH_PARENT_HASH = 'match_parent_hash'
+    COL_MATCH_HASH = 'match_hash'
+    COL_DOC_CHUNK_HASH = 'doc_chunk_hash'
+    COL_SCORE = 'score'
 
     def score(self, match_idx: 'np.ndarray', query_chunk_meta: Dict, match_chunk_meta: Dict) -> 'np.ndarray':
         """Translate the chunk-level top-k results into doc-level top-k results. Some score functions may leverage the
@@ -69,13 +66,13 @@ class Chunk2DocRanker(BaseRanker):
         Group the ``match_idx`` by ``doc_id``
         :return: an iterator over the groups
         """
-        return self._group_by(match_idx, self.col_doc_id)
+        return self._group_by(match_idx, self.COL_MATCH_PARENT_HASH)
 
     @staticmethod
-    def _group_by(match_idx, col):
-        # sort by ``col``
-        _sorted_m = match_idx[match_idx[:, col].argsort()]
-        _, _doc_counts = np.unique(_sorted_m[:, col], return_counts=True)
+    def _group_by(match_idx, col_name):
+        # sort by ``col
+        _sorted_m = np.sort(match_idx, order=col_name)
+        _, _doc_counts = np.unique(_sorted_m[col_name], return_counts=True)
         # group by ``col``
         return np.split(_sorted_m, np.cumsum(_doc_counts))[:-1]
 
@@ -88,34 +85,39 @@ class Chunk2DocRanker(BaseRanker):
         Sort a list of (``doc_id``, ``score``) tuples by the ``score``.
         :return: an `np.ndarray` in the shape of [N x 2], where `N` in the length of the input list.
         """
-        r = np.array(r, dtype=np.float64)
-        r = r[r[:, -1].argsort()[::-1]]
-        return r
+        r = np.array(r, dtype=[
+            (Chunk2DocRanker.COL_MATCH_PARENT_HASH, np.int64),
+            (Chunk2DocRanker.COL_SCORE, np.float64)]
+        )
+        return np.sort(r, order=Chunk2DocRanker.COL_SCORE)[::-1]
 
     def get_doc_id(self, match_with_same_doc_id):
-        return match_with_same_doc_id[0, self.col_doc_id]
+        return match_with_same_doc_id[0][self.COL_MATCH_PARENT_HASH]
 
 
-class MaxRanker(Chunk2DocRanker):
+class Match2DocRanker(BaseRanker):
     """
-    :class:`MaxRanker` calculates the score of the matched doc form the matched chunks. For each matched doc, the score
-        is the maximal score from all the matched chunks belonging to this doc.
-
-    .. warning: Here we suppose that the larger chunk score means the more similar.
-    """
-
-    def _get_score(self, match_idx, query_chunk_meta, match_chunk_meta, *args, **kwargs):
-        return self.get_doc_id(match_idx), match_idx[:, self.col_score].max()
-
-
-class MinRanker(Chunk2DocRanker):
-    """
-    :class:`MinRanker` calculates the score of the matched doc form the matched chunks. For each matched doc, the score
-        is `1 / (1 + s)`, where `s` is the minimal score from all the matched chunks belonging to this doc.
-
-    .. warning:: Here we suppose that the smaller chunk score means the more similar.
+    Re-scores the matches for a document. This Ranker is only responsible for
+    calculating new scores and not for the actual sorting. The sorting is handled
+    in the respective ``Matches2DocRankDriver``.
+    Possible implementations:
+        - ReverseRanker (reverse scores of all matches)
+        - BucketShuffleRanker (first buckets matches and then sort each bucket)
     """
 
-    def _get_score(self, match_idx, query_chunk_meta, match_chunk_meta, *args, **kwargs):
-        _doc_id = match_idx[0, self.col_doc_id]
-        return self.get_doc_id(match_idx), 1. / (1. + match_idx[:, self.col_score].min())
+    COL_MATCH_HASH = 'match_hash'
+    COL_SCORE = 'score'
+
+    def score(self, query_meta: Dict, old_match_scores: Dict, match_meta: Dict) -> 'np.ndarray':
+        """
+        This function calculated the new scores for matches and returns them.
+        :query_meta: a dictionary containing all the query meta information
+            requested by the `required_keys` class_variable.
+        :old_match_scores: contains old scores in the format {match_id: score}
+        :match_meta: a dictionary containing all the matches meta information
+            requested by the `required_keys` class_variable.
+            Format: {match_id: {attribute: attribute_value}}e.g.{5: {"length": 3}}
+        :return: a `np.ndarray` in the shape of [N x 2] where `N` is the length of
+            the `old_match_scores`. Semantic: [[match_id, new_score]]
+        """
+        raise NotImplementedError

@@ -2,17 +2,17 @@ __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
 import os
-from typing import Tuple
+from typing import Tuple, Union, List, Iterator, Optional, Any
 
 import numpy as np
 
 from .. import BaseExecutor
 from ..compound import CompoundExecutor
-from ...helper import call_obj_fn
+from ...helper import call_obj_fn, cached_property, get_readable_size
 
 
 class BaseIndexer(BaseExecutor):
-    """``BaseIndexer`` stores and searches with vectors.
+    """ base class for storing and searching any kind of data structure
 
     The key functions here are :func:`add` and :func:`query`.
     One can decorate them with :func:`jina.decorator.require_train`,
@@ -50,29 +50,18 @@ class BaseIndexer(BaseExecutor):
         """
         super().__init__(*args, **kwargs)
         self.index_filename = index_filename  #: the file name of the stored index, no path is required
+        self.handler_mutex = True  #: only one handler at a time by default
         self._size = 0
 
-    def add(self, keys: 'np.ndarray', vectors: 'np.ndarray', *args, **kwargs):
-        """Add new chunks and their vector representations
-
-        :param keys: ``chunk_id`` in 1D-ndarray, shape B x 1
-        :param vectors: vector representations in B x D
-        """
+    def add(self, *args, **kwargs):
+        raise NotImplementedError
 
     def post_init(self):
         """query handler and write handler can not be serialized, thus they must be put into :func:`post_init`. """
         self.index_filename = self.index_filename or self.name
-        self._query_handler = None
-        self._write_handler = None
+        self.is_handler_loaded = False
 
-    def query(self, vectors: 'np.ndarray', top_k: int, *args, **kwargs) -> Tuple['np.ndarray', 'np.ndarray']:
-        """Find k-NN using query vectors, return chunk ids and chunk scores
-
-        :param vectors: query vectors in ndarray, shape B x D
-        :param top_k: int, the number of nearest neighbour to return
-        :return: a tuple of two ndarray.
-            The first is ids in shape B x K (`dtype=int`), the second is scores in shape B x K (`dtype=float`)
-        """
+    def query(self, *args, **kwargs):
         raise NotImplementedError
 
     @property
@@ -82,32 +71,57 @@ class BaseIndexer(BaseExecutor):
         """
         return self.get_file_from_workspace(self.index_filename)
 
-    @property
+    @cached_property
     def query_handler(self):
-        """A readable and indexable object, could be dict, map, list, numpy array etc. """
-        if self._query_handler is None and os.path.exists(self.index_abspath):
-            self._query_handler = self.get_query_handler()
-            self.logger.info(f'indexer size: {self.size}')
+        """A readable and indexable object, could be dict, map, list, numpy array etc.
 
-        if self._query_handler is None:
-            self.logger.warning(f'you can not query from {self} as its "query_handler" is not set. '
-                                'If you are indexing data from scratch then it is fine. '
-                                'If you are querying data then the index file must be empty or broken.')
-        return self._query_handler
+        .. note::
+            :attr:`query_handler` and :attr:`write_handler` are by default mutex
+        """
+        r = None
+        if (not self.handler_mutex or not self.is_handler_loaded) and self.is_exist:
+            r = self.get_query_handler()
+            if r is None:
+                self.logger.warning(f'you can not query from {self} as its "query_handler" is not set. '
+                                    'If you are indexing data from scratch then it is fine. '
+                                    'If you are querying data then the index file must be empty or broken.')
+            else:
+                self.logger.info(f'indexer size: {self.size}')
+                self.is_handler_loaded = True
+        if r is None:
+            r = self.null_query_handler
+        return r
+
+    @cached_property
+    def null_query_handler(self) -> Optional[Any]:
+        """The empty query handler when :meth:`get_query_handler` fails"""
+        return
 
     @property
-    def write_handler(self):
-        """A writable and indexable object, could be dict, map, list, numpy array etc. """
+    def is_exist(self) -> bool:
+        """Check if the database is exist or not"""
+        return os.path.exists(self.index_abspath)
 
-        if self._write_handler is None:
-            if os.path.exists(self.index_abspath):
-                self._write_handler = self.get_add_handler()
+    @cached_property
+    def write_handler(self):
+        """A writable and indexable object, could be dict, map, list, numpy array etc.
+
+        .. note::
+            :attr:`query_handler` and :attr:`write_handler` are by default mutex
+        """
+
+        # ! a || ( a && b )
+        # =
+        # ! a || b
+        if not self.handler_mutex or not self.is_handler_loaded:
+            r = self.get_add_handler() if self.is_exist else self.get_create_handler()
+
+            if r is None:
+                self.logger.warning('"write_handler" is None, you may not add data to this index, '
+                                    'unless "write_handler" is later assigned with a meaningful value')
             else:
-                self._write_handler = self.get_create_handler()
-        if self._write_handler is None:
-            self.logger.warning('"write_handler" is None, you may not add data to this index, '
-                                'unless "write_handler" is later assigned with a meaningful value')
-        return self._write_handler
+                self.is_handler_loaded = True
+            return r
 
     def get_query_handler(self):
         """Get a *readable* index handler when the ``index_abspath`` already exist, need to be overrided
@@ -134,15 +148,15 @@ class BaseIndexer(BaseExecutor):
 
     def close(self):
         """Close all file-handlers and release all resources. """
-        self.logger.info(f'indexer size: {self.size}')
+        self.logger.info(f'indexer size: {self.size} physical size: {get_readable_size(self.physical_size)}')
         self.flush()
-        call_obj_fn(self._write_handler, 'close')
-        call_obj_fn(self._query_handler, 'close')
+        call_obj_fn(self.write_handler, 'close')
+        call_obj_fn(self.query_handler, 'close')
         super().close()
 
     def flush(self):
         """Flush all buffered data to ``index_abspath`` """
-        call_obj_fn(self._write_handler, 'flush')
+        call_obj_fn(self.write_handler, 'flush')
 
 
 class BaseVectorIndexer(BaseIndexer):
@@ -153,6 +167,34 @@ class BaseVectorIndexer(BaseIndexer):
     It can be used to tell whether an indexer is vector indexer, via ``isinstance(a, BaseVectorIndexer)``
     """
 
+    def query_by_id(self, ids: Union[List[int], 'np.ndarray'], *args, **kwargs) -> 'np.ndarray':
+        """ Get the vectors by id, return a subset of indexed vectors
+
+        :param ids: a list of ``id``, i.e. ``doc.id`` in protobuf
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        raise NotImplementedError
+
+    def add(self, keys: 'np.ndarray', vectors: 'np.ndarray', *args, **kwargs):
+        """Add new chunks and their vector representations
+
+        :param keys: ``chunk_id`` in 1D-ndarray, shape B x 1
+        :param vectors: vector representations in B x D
+        """
+        raise NotImplementedError
+
+    def query(self, keys: 'np.ndarray', top_k: int, *args, **kwargs) -> Tuple['np.ndarray', 'np.ndarray']:
+        """Find k-NN using query vectors, return chunk ids and chunk scores
+
+        :param keys: query vectors in ndarray, shape B x D
+        :param top_k: int, the number of nearest neighbour to return
+        :return: a tuple of two ndarray.
+            The first is ids in shape B x K (`dtype=int`), the second is scores in shape B x K (`dtype=float`)
+        """
+        raise NotImplementedError
+
 
 class BaseKVIndexer(BaseIndexer):
     """An abstract class for key-value indexer.
@@ -162,8 +204,26 @@ class BaseKVIndexer(BaseIndexer):
     It can be used to tell whether an indexer is key-value indexer, via ``isinstance(a, BaseKVIndexer)``
     """
 
+    def add(self, keys: Iterator[int], values: Iterator[bytes], *args, **kwargs):
+        raise NotImplementedError
 
-class ChunkIndexer(CompoundExecutor):
+    def query(self, key: Any) -> Optional[Any]:
+        """ Find the protobuf chunk/doc using id
+
+        :param key: ``id``
+        :return: protobuf chunk or protobuf document
+        """
+        raise NotImplementedError
+
+    def __getitem__(self, key: Any) -> Optional[Any]:
+        return self.query(key)
+
+
+class UniqueVectorIndexer(CompoundExecutor):
+    """A frequently used pattern for combining a :class:`BaseVectorIndexer` and a :class:`DocIDCache` """
+
+
+class CompoundIndexer(CompoundExecutor):
     """A Frequently used pattern for combining A :class:`BaseVectorIndexer` and :class:`BaseKVIndexer`.
     It will be equipped with predefined ``requests.on`` behaviors:
 
@@ -189,7 +249,7 @@ class ChunkIndexer(CompoundExecutor):
             metas:
               name: vecidx  # a customized name
               workspace: $TEST_WORKDIR
-          - !BasePbIndexer
+          - !BinaryPbIndexer
             with:
               index_filename: chunk.gz
             metas:
@@ -211,7 +271,6 @@ class ChunkIndexer(CompoundExecutor):
                 executor: BaseVectorIndexer
             - !PruneDriver
               with:
-                level: chunk
                 pruned:
                   - embedding
                   - buffer
@@ -220,14 +279,12 @@ class ChunkIndexer(CompoundExecutor):
             - !KVSearchDriver
               with:
                 executor: BaseKVIndexer
-                level: chunk
-          IndexRequest:
+            IndexRequest:
             - !VectorIndexDriver
               with:
                 executor: BaseVectorIndexer
             - !PruneDriver
               with:
-                level: chunk
                 pruned:
                   - embedding
                   - buffer
@@ -235,7 +292,6 @@ class ChunkIndexer(CompoundExecutor):
                   - text
             - !KVIndexDriver
               with:
-                level: chunk
                 executor: BaseKVIndexer
           ControlRequest:
             - !ControlReqDriver {}

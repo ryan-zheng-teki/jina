@@ -1,12 +1,13 @@
 syntax = "proto3";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
 
 package jina;
 
 /**
- * Represents the a (quantized) numpy ndarray
+ * Represents a (quantized) dense n-dim array
  */
-message NdArray {
+message DenseNdArray {
     // the actual array data, in bytes
     bytes buffer = 1;
 
@@ -32,82 +33,58 @@ message NdArray {
 }
 
 /**
- * Represents an unary match result
+ * Represents a general n-dim array, can be either dense or sparse
  */
-message ScoredResult {
-
-    /**
-     * Represents the score of a match
-     */
-    message Score {
-        float value = 1; // value
-        string op_name = 2; // the name of the operator/score function
-        string description = 3; // text description of the score
-        repeated Score operands = 4; // the score can be nested
+message NdArray {
+    oneof content {
+        DenseNdArray dense = 1; // dense representation of the ndarray
+        SparseNdArray sparse = 2; // sparse representation of the ndarray
     }
-
-    oneof body {
-        Chunk match_chunk = 1; // the matched chunk
-        Document match_doc = 2; // the matched document
-    }
-    Score score = 3; // the score of this match
 }
 
 /**
- * Represents a Chunk
+ * Represents a sparse ndarray
  */
-message Chunk {
-    uint32 doc_id = 1; // the document ID of this chunk, universally unique
-    uint32 chunk_id = 2; // the chunk ID, universally unique
+message SparseNdArray {
+    // A 2-D int64 tensor of shape [N, ndims], which specifies the indices of the elements in the sparse tensor that contain nonzero values (elements are zero-indexed)
+    DenseNdArray indices = 1;
 
-    oneof content {
-        // the original text of the chunk (only apply to the text document)
-        string text = 3;
+    // A 1-D tensor of any type and shape [N], which supplies the values for each element in indices.
+    DenseNdArray values = 2;
 
-        // the original ndarray of the chunk (apply to the image/audio/video document)
-        NdArray blob = 4;
+    // A 1-D int64 tensor of shape [ndims], which specifies the dense_shape of the sparse tensor.
+    repeated int64 dense_shape = 3;
+}
 
-        // raw bytes of chunk
-        bytes buffer = 5;
-    }
-
-    // the embedding array of this chunk
-    NdArray embedding = 6;
-
-    // the offset of this chunk in the current document
-    uint32 offset = 7;
-
-    // the weight of this chunk
-    float weight = 8;
-
-    // the total number of chunks in the current document
-    uint32 length = 9;
-
-    // some binary meta information of this chunk in bytes
-    bytes meta_info = 10;
-
-    // the top-k matched chunks
-    repeated ScoredResult topk_results = 11;
-
-    // mime type of this chunk, by default it is inherit from the document
-    string mime_type = 12;
-
-    // the field name
-    string field_name = 13;
-
-    // a map of tags
-    map<string, string> tags = 14;
-
-    // the position of the chunk, could be start and end index of a string; could be x,y coordinate of a image; could be timestamp of an audio clip
-    repeated uint32 location = 15;
+/**
+ * Represents the relevance model to `ref_id`
+ */
+message NamedScore {
+    float value = 1; // value
+    string op_name = 2; // the name of the operator/score function
+    string description = 3; // text description of the score
+    repeated NamedScore operands = 4; // the score can be nested
+    string ref_id = 5; // the score is computed between doc `id` and `ref_id`
 }
 
 /**
  * Represents a Document
  */
 message Document {
-    // The unique document ID
-    uint32 doc_id = 1;
+    // A hexdigest that represents a unique document ID
+    string id = 1;
+
+    // the depth of the recursive chunk structure
+    uint32 granularity = 14;
+
+    // the width of the recursive match structure
+    uint32 adjacency = 22;
+
+    // the name of the level
+    string level_name = 15;
+
+    // the parent id from the previous level
+    string parent_id = 16;
 
     oneof content {
         // the raw binary content of this document, which often represents the original document when comes into jina
@@ -120,20 +97,20 @@ message Document {
         string text = 13;
     }
 
-    // list of the chunks of this document
-    repeated Chunk chunks = 4;
+    // list of the chunks of this document (recursive structure)
+    repeated Document chunks = 4;
 
     // the weight of this document
     float weight = 5;
 
-    // total number of chunks in this document
+    // total number of siblings of this document (docs that are in the same granularity and parent_id)
     uint32 length = 6;
 
-    // some binary meta information of this chunk in bytes
+    // some binary meta information of this Doc in bytes
     bytes meta_info = 7;
 
-    // the top-k matched chunks
-    repeated ScoredResult topk_results = 8;
+    // the top-k matched Docs on the same level (recursive structure)
+    repeated Document matches = 8;
 
     // mime type of this document, for buffer content, this is required; for other contents, this can be guessed
     string mime_type = 10;
@@ -141,8 +118,38 @@ message Document {
     // a uri of the document could be: a local file path, a remote url starts with http or https or data URI scheme
     string uri = 9;
 
-    // a map of tags
-    map<string, string> tags = 11;
+    // a structured data value, consisting of field which map to dynamically typed values.
+    google.protobuf.Struct tags = 11;
+
+    // the position of the doc, could be start and end index of a string; could be x,y (top, left) coordinate of an image crop; could be timestamp of an audio clip
+    repeated uint32 location = 17;
+
+    // the offset of this doc in the previous level document
+    uint32 offset = 18;
+
+    // the embedding array of this doc
+    NdArray embedding = 19;
+
+    // TODO: List of matching scores performed on the document, each element corresponds to a metric
+    NamedScore score = 20;
+
+    // modality, an identifier to the modality this document belongs to. In the scope of multi/cross modal search
+    string modality = 21;
+
+    // List of evaluations performed on the document, each element corresponds to a metric
+    repeated NamedScore evaluations = 23;
+
+}
+
+/**
+ * Represents a the route paths of this message
+ */
+message Route {
+    string pod = 1; // the name of the BasePod
+    string pod_id = 2; // the id of the BasePod
+    google.protobuf.Timestamp start_time = 3; // receiving time
+    google.protobuf.Timestamp end_time = 4; // sending (out) time
+    Status status = 5; // the status of the execution
 }
 
 /**
@@ -156,20 +163,11 @@ message Envelope {
     string receiver_id = 2;
 
     // unique id of the request
-    uint32 request_id = 3;
+    string request_id = 3;
 
-    // timeout in second until this message is droped
+    // timeout in second until this message is dropped
     uint32 timeout = 4;
 
-    /**
-     * Represents a the route paths of this message
-     */
-    message Route {
-        string pod = 1; // the name of the BasePod
-        string pod_id = 2; // the id of the BasePod
-        google.protobuf.Timestamp start_time = 3; // receiving time
-        google.protobuf.Timestamp end_time = 4; // sending (out) time
-    }
     repeated Route routes = 5; // a list of routes this message goes through
 
     /**
@@ -183,10 +181,29 @@ message Envelope {
 
     Version version = 6; // version info
 
-    Status status = 7; // status info
+    Status status = 7; // status info, when present, it is the first exception that routes carry
 
     repeated uint32 num_part = 8; // the number of partial messages
 
+    string request_type = 9; // type of the request: TrainRequest, IndexRequest, SearchRequest, ControlRequest
+
+    bool check_version = 10; // check local Protobuf version on every Pod that this message flows to
+
+    CompressConfig compression = 11; // compress configuration used for request
+
+}
+
+/**
+ * Represents a config for the compression algorithm
+ */
+message CompressConfig {
+    string algorithm = 1;  // compress algorithm used for request
+
+    uint64 high_watermark = 2; // the high watermark that triggers the message compression. message bigger than this HWM (in bytes) will be compressed by the algorithm.
+
+    float low_watermark = 3; // the low watermark that enables the sending of a compressed message. compression rate (after_size/before_size) lower than this LWM will be considered as successeful compression, and will be sent. Otherwise, it will send the original message without compression
+
+    google.protobuf.Struct parameters = 4; // other parameters that can be accepted by the algorithm
 }
 
 message Status {
@@ -196,8 +213,9 @@ message Status {
         PENDING = 1; // there are pending messages, more messages are followed
         READY = 2; // ready to use
         ERROR = 3; // error
-        ERROR_DUPLICATE = 4; // already a existing pea/pod running
-        ERROR_NOTALLOWED = 5; // not allowed to open pea/pod remotely
+        ERROR_DUPLICATE = 4; // already a existing pod running
+        ERROR_NOTALLOWED = 5; // not allowed to open pod remotely
+        ERROR_CHAINED = 6; // chained from the previous error
     }
 
     // status code
@@ -206,29 +224,27 @@ message Status {
     // error description of the very first exception
     string description = 2;
 
-    message Details {
-        // the name of that problematic peapod
-        string pod = 1;
-
-        // the id of that problematic peapod
-        string pod_id = 2;
-
-        // the name of the executor binded to that peapod (if applicable)
-        string executor = 3;
-
+    message Exception {
         // the class name of the exception
-        string exception = 4;
+        string name = 1;
 
-        // the reason of the exception
-        string traceback = 5;
+        // the list of arguments given to the exception constructor.
+        repeated string args = 2;
 
-        // the timestamp when error occurs
-        google.protobuf.Timestamp time = 6;
+        // the exception traceback stacks
+        repeated string stacks = 3;
+
+        // the name of the executor bind to that peapod (if applicable)
+        string executor = 4;
+
+        // the name of the driver bind to that peapod (if applicable)
+        string driver = 5;
+
 
     }
 
     // the details of the error
-    repeated Details details = 3;
+    Exception exception = 3;
 }
 
 /**
@@ -244,7 +260,7 @@ message Message {
  */
 message Request {
 
-    uint32 request_id = 1; // the unique ID of this request. Multiple requests with the same ID will be gathered
+    string request_id = 1; // the unique ID of this request. Multiple requests with the same ID will be gathered
 
     oneof body {
         TrainRequest train = 2; // a train request
@@ -258,8 +274,10 @@ message Request {
      */
     message TrainRequest {
         repeated Document docs = 1; // a list of Documents to train
-        bool flush = 2; // if True then do actual training, otherwise only collect all documents but not do training.
-        repeated string filter_by = 3; // a list of the selected field names to be queried on
+
+        repeated Document groundtruths = 2; // the groundtruth document you want to evaluate it with
+
+        bool flush = 3; // if True then do actual training, otherwise only collect all documents but not do training.
     }
 
     /**
@@ -267,7 +285,8 @@ message Request {
      */
     message IndexRequest {
         repeated Document docs = 1; // a list of Documents to index
-        repeated string filter_by = 2; // a list of the selected field names to be queried on
+
+        repeated Document groundtruths = 2; // the groundtruth document you want to evaluate it with
     }
 
     /**
@@ -275,8 +294,8 @@ message Request {
      */
     message SearchRequest {
         repeated Document docs = 1; // a list of Documents to query
-        uint32 top_k = 2; // the number of most related results to return
-        repeated string filter_by = 3; // a list of the selected field names to be queried on
+
+        repeated Document groundtruths = 2; // the groundtruth document you want to evaluate it with
     }
 
     /**
@@ -294,6 +313,17 @@ message Request {
     }
 
     Status status = 6; // status info
+
+    repeated Route routes = 8; // status info on every routes
+
+    repeated QueryLang queryset = 7; // the query set
+}
+
+message QueryLang {
+    string name = 1; // the name of the query lang, map to the corresponding driver
+    google.protobuf.Struct parameters = 2; // the parameter of the query lang
+    bool disabled = 3; // when set, then is query lang is disabled
+    int32 priority = 4; // when query lang is set on both driver and request levels, higher priority query lang is applied, lower priority is dropped
 }
 
 message SpawnRequest {
@@ -329,7 +359,7 @@ message SpawnRequest {
  * jina gRPC service.
  */
 service JinaRPC {
-    // Pass in a Request and a filled Request with topk_results will be returned.
+    // Pass in a Request and a filled Request with matches will be returned.
     rpc Call (stream Request) returns (stream Request) {
     }
 

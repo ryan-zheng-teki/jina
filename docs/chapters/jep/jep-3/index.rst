@@ -80,12 +80,12 @@ Adapt Index-Flow Pods
 During index time, most parts of the ``Flow`` stay the same as before.
 
 To make the ``Encoder`` only encode the ``Chunks`` whose ``field_name`` meet the selected fields, a new argument, ``filter_by``, is introduced to specify which fields will be encoded.
-To do so, we need adapt ``EncodeDriver`` and the ``extract_chunks()``.
+To do so, we need adapt ``EncodeDriver`` and the ``extract_docs()``.
 
 .. highlight:: python
 .. code-block:: python
 
-    def extract_chunks(
+    def extract_docs(
             docs: Iterable['jina_pb2.Document'],
             filter_by: Union[str, Tuple[str], List[str]],
             embedding: bool) -> Tuple:
@@ -106,7 +106,7 @@ To do so, we need adapt ``EncodeDriver`` and the ``extract_chunks()``.
             if self._request.__class__.__name__ == 'SearchRequest':
                 filter_by = self.req.filter_by
             contents, chunk_pts, no_chunk_docs, bad_chunk_ids = \
-                extract_chunks(self.req.docs, self.filter_by, embedding=False)
+                extract_docs(self.req.docs, self.filter_by, embedding=False)
 
 
 In order to make the ``Indexer`` only index the ``Chunks`` whose ``field_name`` meet the selected fields, we need to adapt the ``VectorIndexDriver`` as well.
@@ -121,7 +121,7 @@ In order to make the ``Indexer`` only index the ``Chunks`` whose ``field_name`` 
 
         def __call__(self, *args, **kwargs):
             embed_vecs, chunk_pts, no_chunk_docs, bad_chunk_ids = \
-                extract_chunks(self.req.docs, self.filter_by, embedding=True)
+                extract_docs(self.req.docs, self.filter_by, embedding=True)
 
 
 The same change goes for the ``ChunkKVIndexDriver``.
@@ -173,7 +173,7 @@ Furthermore, the ``VectorSearchDriver`` and the ``KVSearchDriver`` also need to 
     class VectorSearchDriver(BaseSearchDriver):
         def __call__(self, *args, **kwargs):
             embed_vecs, chunk_pts, no_chunk_docs, bad_chunk_ids = \
-                extract_chunks(self.req.docs, self.req.filter_by, embedding=True)
+                extract_docs(self.req.docs, self.req.filter_by, embedding=True)
             ...
 
 
@@ -210,18 +210,18 @@ For the use case above, the `index.yml` will be defined as following,
     !Flow
     pods:
       fields_mapper:
-        yaml_path: mapper.yml
+        uses: mapper.yml
       title_encoder:
-        yaml_path: title_encoder.yml
+        uses: title_encoder.yml
         needs: fields_mapper
       sum_encoder:
-        yaml_path: sum_encoder.yml
+        uses: sum_encoder.yml
         needs: fields_mapper
       title_indexer:
-        yaml_path: title_indexer.yml
+        uses: title_indexer.yml
         needs: title_encoder
       sum_indexer:
-        yaml_path: sum_indexer.yml
+        uses: sum_indexer.yml
         needs: sum_encoder
       join:
         needs:
@@ -279,7 +279,6 @@ The `sum_indexer.yml` is as below,
           - !PruneDriver {}
           - !KVIndexDriver
             with:
-              level: chunk
               executor: BasePbIndexer
               filter_by: summ
         SearchRequest:
@@ -290,7 +289,6 @@ The `sum_indexer.yml` is as below,
           - !PruneDriver {}
           - !KVSearchDriver
             with:
-              level: chunk
               executor: BasePbIndexer
               filter_by: summ
 

@@ -1,26 +1,29 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
+import argparse
+import base64
 import copy
 import os
 import tempfile
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import ExitStack
-from functools import wraps
-from typing import Union, Tuple, List, Set, Dict, Iterator, Callable, Type, TextIO, Any
+from typing import Optional, Union, Tuple, List, Set, Dict, Iterator, Callable, Type, TextIO, Any
+from urllib.request import Request, urlopen
 
 import ruamel.yaml
 from ruamel.yaml import StringIO
 
+from .builder import build_required, _build_flow, _optimize_flow
 from .. import JINA_GLOBAL
-from ..enums import FlowBuildLevel, FlowOptimizeLevel
-from ..excepts import FlowTopologyError, FlowMissingPodError, FlowBuildLevelError
-from ..helper import yaml, expand_env_var, get_non_defaults_args, deprecated_alias
-from ..logging import get_logger
+from ..enums import FlowBuildLevel, PodRoleType, FlowInspectType
+from ..excepts import FlowTopologyError, FlowMissingPodError
+from ..helper import yaml, expand_env_var, get_non_defaults_args, deprecated_alias, complete_path
+from ..logging import JinaLogger
 from ..logging.sse import start_sse_logger
-from ..peapods.pod import SocketType, FlowPod, GatewayFlowPod
+from ..peapods.pod import FlowPod, GatewayFlowPod
 
 if False:
     from ..proto import jina_pb2
@@ -28,42 +31,8 @@ if False:
     import numpy as np
 
 
-def build_required(required_level: 'FlowBuildLevel'):
-    """Annotate a function so that it requires certain build level to run.
-
-    :param required_level: required build level to run this function.
-
-    Example:
-
-    .. highlight:: python
-    .. code-block:: python
-
-        @build_required(FlowBuildLevel.RUNTIME)
-        def foo():
-            print(1)
-
-    """
-
-    def __build_level(func):
-        @wraps(func)
-        def arg_wrapper(self, *args, **kwargs):
-            if hasattr(self, '_build_level'):
-                if self._build_level.value >= required_level.value:
-                    return func(self, *args, **kwargs)
-                else:
-                    raise FlowBuildLevelError(
-                        'build_level check failed for %r, required level: %s, actual level: %s' % (
-                            func, required_level, self._build_level))
-            else:
-                raise AttributeError(f'{self!r} has no attribute "_build_level"')
-
-        return arg_wrapper
-
-    return __build_level
-
-
-class Flow:
-    def __init__(self, args: 'argparse.Namespace' = None, **kwargs):
+class Flow(ExitStack):
+    def __init__(self, args: Optional['argparse.Namespace'] = None, **kwargs):
         """Initialize a flow object
 
         :param kwargs: other keyword arguments that will be shared by all pods in this flow
@@ -76,31 +45,32 @@ class Flow:
         .. highlight:: python
         .. code-block:: python
 
-            f = Flow(optimize_level=FlowOptimizeLevel.NONE).add(yaml_path='forward', replicas=3)
+            f = Flow(optimize_level=FlowOptimizeLevel.NONE).add(uses='forward', parallel=3)
 
         The optimized version, i.e. :code:`Flow(optimize_level=FlowOptimizeLevel.FULL)`
         will generate 4 Peas, but it will force the :class:`GatewayPea` to take BIND role,
         as the head and tail routers are removed.
-        
-        """
-        self.logger = get_logger(self.__class__.__name__)
-        self._pod_nodes = OrderedDict()  # type: Dict[str, 'FlowPod']
-        self._build_level = FlowBuildLevel.EMPTY
-        self._pod_name_counter = 0
-        self._last_changed_pod = ['gateway']  #: default first pod is gateway, will add when build()
 
+        """
+        super().__init__()
+        if isinstance(args, argparse.Namespace):
+            self.logger = JinaLogger(self.__class__.__name__, **vars(args))
+        else:
+            self.logger = JinaLogger(self.__class__.__name__)
+        self._pod_nodes = OrderedDict()  # type: Dict[str, 'FlowPod']
+        self._inspect_pods = {}  # type: Dict[str, str]
+        self._build_level = FlowBuildLevel.EMPTY
+        self._last_changed_pod = ['gateway']  #: default first pod is gateway, will add when build()
         self._update_args(args, **kwargs)
 
     def _update_args(self, args, **kwargs):
-        from ..main.parser import set_flow_parser
+        from ..parser import set_flow_parser
         _flow_parser = set_flow_parser()
         if args is None:
             from ..helper import get_parsed_args
             _, args, _ = get_parsed_args(kwargs, _flow_parser, 'Flow')
 
         self.args = args
-        if kwargs and self.args.logserver and 'log_sse' not in kwargs:
-            kwargs['log_sse'] = True
         self._common_kwargs = kwargs
         self._kwargs = get_non_defaults_args(args, _flow_parser)  #: for yaml dump
 
@@ -181,6 +151,7 @@ class Flow:
         if not filename: raise FileNotFoundError
         if isinstance(filename, str):
             # deserialize from the yaml
+            filename = complete_path(filename)
             with open(filename, encoding='utf8') as fp:
                 return yaml.load(fp)
         else:
@@ -222,7 +193,7 @@ class Flow:
             endpoint = [endpoint]
         elif not endpoint:
             if op_flow._last_changed_pod and connect_to_last_pod:
-                endpoint = [op_flow._last_changed_pod[-1]]
+                endpoint = [op_flow.last_pod]
             else:
                 endpoint = []
 
@@ -232,9 +203,17 @@ class Flow:
                     raise FlowTopologyError('the income/output of a pod can not be itself')
         else:
             raise ValueError(f'endpoint={endpoint} is not parsable')
-        return set(endpoint)
 
-    def set_last_pod(self, name: str, copy_flow: bool = True) -> 'Flow':
+        # if an endpoint is being inspected, then replace it with inspected Pod
+        endpoint = set(op_flow._inspect_pods.get(ep, ep) for ep in endpoint)
+        return endpoint
+
+    @property
+    def last_pod(self):
+        return self._last_changed_pod[-1]
+
+    @last_pod.setter
+    def last_pod(self, name: str):
         """
         Set a pod as the last pod in the flow, useful when modifying the flow.
 
@@ -242,21 +221,17 @@ class Flow:
         :param copy_flow: when set to true, then always copy the current flow and do the modification on top of it then return, otherwise, do in-line modification
         :return: a (new) flow object with modification
         """
-        op_flow = copy.deepcopy(self) if copy_flow else self
-
-        if name not in op_flow._pod_nodes:
+        if name not in self._pod_nodes:
             raise FlowMissingPodError(f'{name} can not be found in this Flow')
 
-        if op_flow._last_changed_pod and name == op_flow._last_changed_pod[-1]:
+        if self._last_changed_pod and name == self.last_pod:
             pass
         else:
-            op_flow._last_changed_pod.append(name)
+            self._last_changed_pod.append(name)
 
         # graph is now changed so we need to
         # reset the build level to the lowest
-        op_flow._build_level = FlowBuildLevel.EMPTY
-
-        return op_flow
+        self._build_level = FlowBuildLevel.EMPTY
 
     def _add_gateway(self, needs, **kwargs):
         pod_name = 'gateway'
@@ -265,22 +240,24 @@ class Flow:
         kwargs['name'] = 'gateway'
         self._pod_nodes[pod_name] = GatewayFlowPod(kwargs, needs)
 
-        # self.set_last_pod(pod_name, False)
-
-    def join(self, needs: Union[Tuple[str], List[str]], *args, **kwargs) -> 'Flow':
+    def needs(self, needs: Union[Tuple[str], List[str]],
+              uses: str = '_merge', name: str = 'joiner', *args, **kwargs) -> 'Flow':
         """
         Add a blocker to the flow, wait until all peas defined in **needs** completed.
 
         :param needs: list of service names to wait
+        :param uses: the config of the executor, by default is ``_merge``
+        :param name: the name of this joiner, by default is ``joiner``
         :return: the modified flow
         """
         if len(needs) <= 1:
             raise FlowTopologyError('no need to wait for a single service, need len(needs) > 1')
-        return self.add(name='joiner', yaml_path='_merge', needs=needs, *args, **kwargs)
+        return self.add(name=name, uses=uses, needs=needs, pod_role=PodRoleType.JOIN, *args, **kwargs)
 
     def add(self,
             needs: Union[str, Tuple[str], List[str]] = None,
             copy_flow: bool = True,
+            pod_role: 'PodRoleType' = PodRoleType.POD,
             **kwargs) -> 'Flow':
         """
         Add a pod to the current flow object and return the new modified flow object.
@@ -292,6 +269,7 @@ class Flow:
 
         :param needs: the name of the pod(s) that this pod receives data from.
                            One can also use 'pod.Gateway' to indicate the connection with the gateway.
+        :param pod_role: the role of the Pod, used for visualization and route planning
         :param copy_flow: when set to true, then always copy the current flow and do the modification on top of it then return, otherwise, do in-line modification
         :param kwargs: other keyword-value arguments that the pod CLI supports
         :return: a (new) flow object with modification
@@ -302,11 +280,12 @@ class Flow:
         pod_name = kwargs.get('name', None)
 
         if pod_name in op_flow._pod_nodes:
-            raise FlowTopologyError(f'name: {pod_name} is used in this Flow already!')
+            new_name = f'{pod_name}{len(op_flow._pod_nodes)}'
+            self.logger.debug(f'"{pod_name}" is used in this Flow already! renamed it to "{new_name}"')
+            pod_name = new_name
 
         if not pod_name:
-            pod_name = '%s%d' % ('pod', op_flow._pod_name_counter)
-            op_flow._pod_name_counter += 1
+            pod_name = f'pod{len(op_flow._pod_nodes)}'
 
         if not pod_name.isidentifier():
             # hyphen - can not be used in the name
@@ -314,13 +293,92 @@ class Flow:
 
         needs = op_flow._parse_endpoints(op_flow, pod_name, needs, connect_to_last_pod=True)
 
-        kwargs.update(op_flow._common_kwargs)
-        kwargs['name'] = pod_name
-        op_flow._pod_nodes[pod_name] = FlowPod(kwargs=kwargs, needs=needs)
+        for key, value in op_flow._common_kwargs.items():
+            if key not in kwargs:
+                kwargs[key] = value
 
-        op_flow.set_last_pod(pod_name, False)
+        kwargs['name'] = pod_name
+
+        op_flow._pod_nodes[pod_name] = self._invoke_flowpod(kwargs, needs, pod_role)
+        op_flow.last_pod = pod_name
 
         return op_flow
+
+    def _invoke_flowpod(self, kwargs, needs, pod_role):
+        """This gets inherited in jinad"""
+        return FlowPod(kwargs=kwargs, needs=needs, pod_role=pod_role)
+
+    def inspect(self, name: str = 'inspect', *args, **kwargs) -> 'Flow':
+        """Add an inspection on the last changed Pod in the Flow
+
+        Internally, it adds two pods to the flow. But no worry, the overhead is minimized and you
+        can remove them by simply give `Flow(inspect=FlowInspectType.REMOVE)` before using the flow.
+
+        .. highlight:: bash
+        .. code-block:: bash
+
+            Flow -- PUB-SUB -- BasePod(_pass) -- Flow
+                    |
+                    -- PUB-SUB -- InspectPod (Hanging)
+
+        In this way, :class:`InspectPod` looks like a simple ``_pass`` from outside and
+        does not introduce side-effect (e.g. changing the socket type) to the original flow.
+        The original incoming and outgoing socket types are preserved.
+
+        This function is very handy for introducing evaluator into the flow.
+
+        .. seealso::
+
+            :meth:`gather_inspect`
+
+        """
+
+        _last_pod = self.last_pod
+        op_flow = self.add(name=name, needs=_last_pod, pod_role=PodRoleType.INSPECT, *args, **kwargs)
+
+        # now remove uses and add an auxiliary Pod
+        if 'uses' in kwargs:
+            kwargs.pop('uses')
+        op_flow = op_flow.add(name=f'_aux_{name}', uses='_pass', needs=_last_pod,
+                              pod_role=PodRoleType.INSPECT_AUX_PASS, *args, **kwargs)
+
+        # register any future connection to _last_pod by the auxiliary pod
+        op_flow._inspect_pods[_last_pod] = op_flow.last_pod
+
+        return op_flow
+
+    def gather_inspect(self, name: str = 'gather_inspect', uses='_merge_eval', include_last_pod: bool = True, *args,
+                       **kwargs) -> 'Flow':
+        """ Gather all inspect pods output into one pod. When the flow has no inspect pod then the flow itself
+        is returned.
+
+        .. note::
+
+            If ``--no-inspect`` is **not** given, then :meth:`gather_inspect` is auto called before :meth:`build`. So
+            in general you don't need to manually call :meth:`gather_inspect`.
+
+        :param name: the name of the gather pod
+        :param uses: the config of the executor, by default is ``_merge``
+        :param include_last_pod: if to include the last modified pod in the flow
+        :param args:
+        :param kwargs:
+        :return: the modified flow or the copy of it
+
+
+        .. seealso::
+
+            :meth:`inspect`
+
+        """
+
+        needs = [k for k, v in self._pod_nodes.items() if v.role == PodRoleType.INSPECT]
+        if needs:
+            if include_last_pod:
+                needs.append(self.last_pod)
+            return self.add(name=name, uses=uses, needs=needs, pod_role=PodRoleType.JOIN_INSPECT, *args, **kwargs)
+        else:
+            # no inspect node is in the graph, return the current graph
+            return self
 
     def build(self, copy_flow: bool = False) -> 'Flow':
         """
@@ -353,69 +411,36 @@ class Flow:
 
         _pod_edges = set()
 
+        if op_flow.args.inspect == FlowInspectType.COLLECT:
+            op_flow.gather_inspect(copy_flow=False)
+
         if 'gateway' not in op_flow._pod_nodes:
-            op_flow._add_gateway(needs={op_flow._last_changed_pod[-1]})
+            op_flow._add_gateway(needs={op_flow.last_pod})
 
-        # direct all income peas' output to the current service
-        for k, p in op_flow._pod_nodes.items():
-            for s in p.needs:
-                if s not in op_flow._pod_nodes:
-                    raise FlowMissingPodError(f'{s} is not in this flow, misspelled name?')
-                _pod_edges.add(f'{s}-{k}')
+        # construct a map with a key a start node and values an array of its end nodes
+        _outgoing_map = defaultdict(list)
 
-        for k in _pod_edges:
-            s_name, e_name = k.split('-')
-            edges_with_same_start = [ed for ed in _pod_edges if ed.startswith(s_name)]
-            edges_with_same_end = [ed for ed in _pod_edges if ed.endswith(e_name)]
+        # if set no_inspect then all inspect related nodes are removed
+        if op_flow.args.inspect == FlowInspectType.REMOVE:
+            op_flow._pod_nodes = {k: v for k, v in op_flow._pod_nodes.items() if not v.role.is_inspect}
+            reverse_inspect_map = {v: k for k, v in op_flow._inspect_pods.items()}
 
-            s_pod = op_flow._pod_nodes[s_name]
-            e_pod = op_flow._pod_nodes[e_name]
-
-            # Rule
-            # if a node has multiple income/outgoing peas,
-            # then its socket_in/out must be PULL_BIND or PUB_BIND
-            # otherwise it should be different than its income
-            # i.e. income=BIND => this=CONNECT, income=CONNECT => this = BIND
-            #
-            # when a socket is BIND, then host must NOT be set, aka default host 0.0.0.0
-            # host_in and host_out is only set when corresponding socket is CONNECT
-
-            if len(edges_with_same_start) > 1 and len(edges_with_same_end) == 1:
-                FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUB_BIND)
-            elif len(edges_with_same_start) == 1 and len(edges_with_same_end) > 1:
-                FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_CONNECT)
-            elif len(edges_with_same_start) == 1 and len(edges_with_same_end) == 1:
-                # in this case, either side can be BIND
-                # we prefer gateway to be always CONNECT so that multiple clients can connect to it
-                # check if either node is gateway
-                # this is the only place where gateway appears
-                if s_name == 'gateway':
-                    if self.args.optimize_level > FlowOptimizeLevel.IGNORE_GATEWAY and e_pod.is_head_router:
-                        # connect gateway directly to peas
-                        e_pod.connect_to_tail_of(s_pod)
-                    else:
-                        FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_CONNECT)
-                elif e_name == 'gateway':
-                    if self.args.optimize_level > FlowOptimizeLevel.IGNORE_GATEWAY and s_pod.is_tail_router and s_pod.tail_args.num_part <= 1:
-                        # connect gateway directly to peas only if this is unblock router
-                        # as gateway can not block & reduce message
-                        s_pod.connect_to_head_of(e_pod)
-                    else:
-                        FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_BIND)
-                else:
-                    e_pod.head_args.socket_in = s_pod.tail_args.socket_out.paired
-                    if self.args.optimize_level > FlowOptimizeLevel.NONE and e_pod.is_head_router and not s_pod.is_tail_router:
-                        e_pod.connect_to_tail_of(s_pod)
-                    elif self.args.optimize_level > FlowOptimizeLevel.NONE and s_pod.is_tail_router and s_pod.tail_args.num_part <= 1:
-                        s_pod.connect_to_head_of(e_pod)
-                    else:
-                        FlowPod.connect(s_pod, e_pod, first_socket_type=SocketType.PUSH_CONNECT)
+        for end, pod in op_flow._pod_nodes.items():
+            # if an endpoint is being inspected, then replace it with inspected Pod
+            # but not those inspect related node
+            if op_flow.args.inspect.is_keep:
+                pod.needs = set(ep if pod.role.is_inspect else op_flow._inspect_pods.get(ep, ep) for ep in pod.needs)
             else:
-                raise FlowTopologyError('found %d edges start with %s and %d edges end with %s, '
-                                        'this type of topology is ambiguous and should not exist, '
-                                        'i can not determine the socket type' % (
-                                            len(edges_with_same_start), s_name, len(edges_with_same_end), e_name))
+                pod.needs = set(reverse_inspect_map.get(ep, ep) for ep in pod.needs)
 
+            for start in pod.needs:
+                if start not in op_flow._pod_nodes:
+                    raise FlowMissingPodError(f'{start} is not in this flow, misspelled name?')
+                _outgoing_map[start].append(end)
+                _pod_edges.add((start, end))
+
+        op_flow = _build_flow(op_flow, _outgoing_map)
+        op_flow = _optimize_flow(op_flow, _outgoing_map, _pod_edges)
         op_flow._build_level = FlowBuildLevel.GRAPH
         return op_flow
 
@@ -426,7 +451,21 @@ class Flow:
         return self.start()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        super().__exit__(exc_type, exc_val, exc_tb)
+        if self.args.logserver:
+            self._stop_log_server()
+        self._build_level = FlowBuildLevel.EMPTY
+        self.logger.success(
+            f'flow is closed and all resources should be released already, current build level is {self._build_level}')
+        self.logger.close()
+
+    def _stop_log_server(self):
+        import urllib.request
+        try:
+            # it may have been shutdown from the outside
+            urllib.request.urlopen(JINA_GLOBAL.logserver.shutdown, timeout=5)
+        except Exception as ex:
+            self.logger.info(f'Failed to connect to shutdown log sse server: {repr(ex)}')
 
     def _start_log_server(self):
         try:
@@ -438,14 +477,15 @@ class Flow:
                                                       self.yaml_spec))
             self._sse_logger.start()
             time.sleep(1)
-            urllib.request.urlopen(JINA_GLOBAL.logserver.ready, timeout=5)
-            self.logger.success(f'logserver is started and available at {JINA_GLOBAL.logserver.address}')
+            response = urllib.request.urlopen(JINA_GLOBAL.logserver.ready, timeout=5)
+            if response.status == 200:
+                self.logger.success(f'logserver is started and available at {JINA_GLOBAL.logserver.address}')
         except ModuleNotFoundError:
             self.logger.error(
                 f'sse logserver can not start because of "flask" and "flask_cors" are missing, '
                 f'use pip install "jina[http]" (with double quotes) to install the dependencies')
-        except:
-            self.logger.error('logserver fails to start')
+        except Exception as ex:
+            self.logger.error(f'logserver fails to start: {repr(ex)}')
 
     def start(self):
         """Start to run all Pods in this Flow.
@@ -460,17 +500,13 @@ class Flow:
             self.build(copy_flow=False)
 
         if self.args.logserver:
-            self.logger.info('start logserver...')
+            self.logger.info('starting logserver...')
             self._start_log_server()
 
-        self._pod_stack = ExitStack()
         for v in self._pod_nodes.values():
-            self._pod_stack.enter_context(v)
+            self.enter_context(v)
 
-        self.logger.info('%d Pods (i.e. %d Peas) are running in this Flow' % (
-            self.num_pods,
-            self.num_peas))
-
+        self.logger.info(f'{self.num_pods} Pods (i.e. {self.num_peas} Peas) are running in this Flow')
         self.logger.success(f'flow is now ready for use, current build_level is {self._build_level}')
 
         return self
@@ -482,19 +518,8 @@ class Flow:
 
     @property
     def num_peas(self) -> int:
-        """Get the number of peas (replicas count) in this flow"""
+        """Get the number of peas (parallel count) in this flow"""
         return sum(v.num_peas for v in self._pod_nodes.values())
-
-    def close(self):
-        """Close the flow and release all resources associated to it. """
-        if hasattr(self, '_pod_stack'):
-            self._pod_stack.close()
-        # if hasattr(self, 'sse_logger') and self.sse_logger.is_alive():
-        #     self.sse_logger.stop()
-        self._build_level = FlowBuildLevel.EMPTY
-        # time.sleep(1)  # sleep for a while until all resources are safely closed
-        self.logger.success(
-            f'flow is closed and all resources should be released already, current build level is {self._build_level}')
 
     def __eq__(self, other: 'Flow'):
         """
@@ -528,7 +553,7 @@ class Flow:
 
     @deprecated_alias(buffer='input_fn', callback='output_fn')
     def train(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
-              output_fn: Callable[['jina_pb2.Message'], None] = None,
+              output_fn: Callable[['jina_pb2.Request'], None] = None,
               **kwargs):
         """Do training on the current flow
 
@@ -564,11 +589,11 @@ class Flow:
         :param output_fn: the callback function to invoke after training
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
-        self._get_client(**kwargs).train(input_fn, output_fn)
+        self._get_client(**kwargs).train(input_fn, output_fn, **kwargs)
 
     def index_ndarray(self, array: 'np.ndarray', axis: int = 0, size: int = None, shuffle: bool = False,
-                    output_fn: Callable[['jina_pb2.Message'], None] = None,
-                    **kwargs):
+                      output_fn: Callable[['jina_pb2.Request'], None] = None,
+                      **kwargs):
         """Using numpy ndarray as the index source for the current flow
 
         :param array: the numpy ndarray data source
@@ -579,11 +604,11 @@ class Flow:
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_numpy
-        self._get_client(**kwargs).index(input_numpy(array, axis, size, shuffle), output_fn)
+        self._get_client(**kwargs).index(input_numpy(array, axis, size, shuffle), output_fn, **kwargs)
 
     def search_ndarray(self, array: 'np.ndarray', axis: int = 0, size: int = None, shuffle: bool = False,
-                     output_fn: Callable[['jina_pb2.Message'], None] = None,
-                     **kwargs):
+                       output_fn: Callable[['jina_pb2.Request'], None] = None,
+                       **kwargs):
         """Use a numpy ndarray as the query source for searching on the current flow
 
         :param array: the numpy ndarray data source
@@ -594,11 +619,11 @@ class Flow:
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_numpy
-        self._get_client(**kwargs).search(input_numpy(array, axis, size, shuffle), output_fn)
+        self._get_client(**kwargs).search(input_numpy(array, axis, size, shuffle), output_fn, **kwargs)
 
     def index_lines(self, lines: Iterator[str] = None, filepath: str = None, size: int = None,
                     sampling_rate: float = None, read_mode='r',
-                    output_fn: Callable[['jina_pb2.Message'], None] = None,
+                    output_fn: Callable[['jina_pb2.Request'], None] = None,
                     **kwargs):
         """ Use a list of lines as the index source for indexing on the current flow
 
@@ -612,11 +637,12 @@ class Flow:
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_lines
-        self._get_client(**kwargs).index(input_lines(lines, filepath,  size, sampling_rate, read_mode), output_fn)
+        self._get_client(**kwargs).index(input_lines(lines, filepath, size, sampling_rate, read_mode), output_fn,
+                                         **kwargs)
 
     def index_files(self, patterns: Union[str, List[str]], recursive: bool = True,
                     size: int = None, sampling_rate: float = None, read_mode: str = None,
-                    output_fn: Callable[['jina_pb2.Message'], None] = None,
+                    output_fn: Callable[['jina_pb2.Request'], None] = None,
                     **kwargs):
         """ Use a set of files as the index source for indexing on the current flow
 
@@ -626,16 +652,17 @@ class Flow:
         :param size: the maximum number of the files
         :param sampling_rate: the sampling rate between [0, 1]
         :param read_mode: specifies the mode in which the file
-                is opened. 'r' for reading in text mode, 'rb' for reading in
+                is opened. 'r' for reading in text mode, 'rb' for reading in binary mode
         :param output_fn: the callback function to invoke after indexing
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_files
-        self._get_client(**kwargs).index(input_files(patterns, recursive, size, sampling_rate, read_mode), output_fn)
+        self._get_client(**kwargs).index(input_files(patterns, recursive, size, sampling_rate, read_mode), output_fn,
+                                         **kwargs)
 
     def search_files(self, patterns: Union[str, List[str]], recursive: bool = True,
                      size: int = None, sampling_rate: float = None, read_mode: str = None,
-                     output_fn: Callable[['jina_pb2.Message'], None] = None,
+                     output_fn: Callable[['jina_pb2.Request'], None] = None,
                      **kwargs):
         """ Use a set of files as the query source for searching on the current flow
 
@@ -650,11 +677,12 @@ class Flow:
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_files
-        self._get_client(**kwargs).search(input_files(patterns, recursive, size, sampling_rate, read_mode), output_fn)
+        self._get_client(**kwargs).search(input_files(patterns, recursive, size, sampling_rate, read_mode), output_fn,
+                                          **kwargs)
 
     def search_lines(self, filepath: str = None, lines: Iterator[str] = None, size: int = None,
                      sampling_rate: float = None, read_mode='r',
-                     output_fn: Callable[['jina_pb2.Message'], None] = None,
+                     output_fn: Callable[['jina_pb2.Request'], None] = None,
                      **kwargs):
         """ Use a list of files as the query source for searching on the current flow
 
@@ -668,11 +696,12 @@ class Flow:
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_lines
-        self._get_client(**kwargs).search(input_lines(lines, filepath, size, sampling_rate, read_mode), output_fn)
+        self._get_client(**kwargs).search(input_lines(lines, filepath, size, sampling_rate, read_mode), output_fn,
+                                          **kwargs)
 
     @deprecated_alias(buffer='input_fn', callback='output_fn')
-    def index(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
-              output_fn: Callable[['jina_pb2.Message'], None] = None,
+    def index(self, input_fn: Union[Iterator[Union['jina_pb2.Document', bytes]], Callable] = None,
+              output_fn: Callable[['jina_pb2.Request'], None] = None,
               **kwargs):
         """Do indexing on the current flow
 
@@ -708,11 +737,11 @@ class Flow:
         :param output_fn: the callback function to invoke after indexing
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
-        self._get_client(**kwargs).index(input_fn, output_fn)
+        self._get_client(**kwargs).index(input_fn, output_fn, **kwargs)
 
     @deprecated_alias(buffer='input_fn', callback='output_fn')
-    def search(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
-               output_fn: Callable[['jina_pb2.Message'], None] = None,
+    def search(self, input_fn: Union[Iterator[Union['jina_pb2.Document', bytes]], Callable] = None,
+               output_fn: Callable[['jina_pb2.Request'], None] = None,
                **kwargs):
         """Do searching on the current flow
 
@@ -749,7 +778,152 @@ class Flow:
         :param output_fn: the callback function to invoke after searching
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
-        self._get_client(**kwargs).search(input_fn, output_fn)
+        self._get_client(**kwargs).search(input_fn, output_fn, **kwargs)
+
+    def plot(self, output: str = None,
+             vertical_layout: bool = False,
+             inline_display: bool = True,
+             build: bool = True,
+             copy_flow: bool = True) -> 'Flow':
+        """
+        Visualize the flow up to the current point
+        If a file name is provided it will create a jpg image with that name,
+        otherwise it will display the URL for mermaid.
+        If called within IPython notebook, it will be rendered inline,
+        otherwise an image will be created.
+
+        Example,
+
+        .. highlight:: python
+        .. code-block:: python
+
+            flow = Flow().add(name='pod_a').plot('flow.svg')
+
+        :param output: a filename specifying the name of the image to be created,
+                    the suffix svg/jpg determines the file type of the output image
+        :param vertical_layout: top-down or left-right layout
+        :param inline_display: show image directly inside the Jupyter Notebook
+        :param build: build the flow first before plotting, gateway connection can be better showed
+        :param copy_flow: when set to true, then always copy the current flow and
+                do the modification on top of it then return, otherwise, do in-line modification
+        :return: the flow
+        """
+
+        op_flow = copy.deepcopy(self) if copy_flow else self
+        if build:
+            op_flow.build(False)
+        mermaid_graph = ["%%{init: {'theme': 'base', "
+                         "'themeVariables': { 'primaryColor': '#32C8CD', "
+                         "'edgeLabelBackground':'#fff', 'clusterBkg': '#FFCC66'}}}%%"]
+        mermaid_graph.append('graph TD' if vertical_layout else 'graph LR')
+
+        start_repl = {}
+        end_repl = {}
+        for node, v in op_flow._pod_nodes.items():
+            if not v.is_singleton and v.role != PodRoleType.GATEWAY:
+                mermaid_graph.append(f'subgraph sub_{node} ["{node} ({v._args.parallel})"]')
+                if v.is_head_router:
+                    head_router = node + '_HEAD'
+                    end_repl[node] = (head_router, '((fa:fa-random))')
+                if v.is_tail_router:
+                    tail_router = node + '_TAIL'
+                    start_repl[node] = (tail_router, '((fa:fa-random))')
+
+                p_r = '((%s))'
+                p_e = '[[%s]]'
+                for j in range(v._args.parallel):
+                    r = node + (f'_{j}' if v._args.parallel > 1 else '')
+                    if v.is_head_router:
+                        mermaid_graph.append('\t%s%s:::pea-->%s%s:::pea' % (head_router, p_r % 'head', r, p_e % r))
+                    if v.is_tail_router:
+                        mermaid_graph.append('\t%s%s:::pea-->%s%s:::pea' % (r, p_e % r, tail_router, p_r % 'tail'))
+                mermaid_graph.append('end')
+
+        for node, v in op_flow._pod_nodes.items():
+            ed_str = str(v.head_args.socket_in).split('_')[0]
+            for need in sorted(v.needs):
+                edge_str = ''
+                if need in op_flow._pod_nodes:
+                    st_str = str(op_flow._pod_nodes[need].tail_args.socket_out).split('_')[0]
+                    edge_str = f'|{st_str}-{ed_str}|'
+
+                _s = start_repl.get(need, (need, f'({need})'))
+                _e = end_repl.get(node, (node, f'({node})'))
+                _s_role = op_flow._pod_nodes[need].role
+                _e_role = op_flow._pod_nodes[node].role
+                line_st = '-->'
+
+                if _s_role in {PodRoleType.INSPECT, PodRoleType.JOIN_INSPECT}:
+                    _s = start_repl.get(need, (need, f'{{{{{need}}}}}'))
+
+                if _e_role == PodRoleType.GATEWAY:
+                    _e = ('gateway_END', f'({node})')
+                elif _e_role in {PodRoleType.INSPECT, PodRoleType.JOIN_INSPECT}:
+                    _e = end_repl.get(node, (node, f'{{{{{node}}}}}'))
+
+                if _s_role == PodRoleType.INSPECT or _e_role == PodRoleType.INSPECT:
+                    line_st = '-.->'
+
+                mermaid_graph.append(
+                    f'{_s[0]}{_s[1]}:::{str(_s_role)} {line_st} {edge_str}{_e[0]}{_e[1]}:::{str(_e_role)}')
+        mermaid_graph.append(f'classDef {str(PodRoleType.POD)} fill:#32C8CD,stroke:#009999')
+        mermaid_graph.append(f'classDef {str(PodRoleType.INSPECT)} fill:#ff6666,color:#fff')
+        mermaid_graph.append(f'classDef {str(PodRoleType.JOIN_INSPECT)} fill:#ff6666,color:#fff')
+        mermaid_graph.append(f'classDef {str(PodRoleType.GATEWAY)} fill:#6E7278,color:#fff')
+        mermaid_graph.append(f'classDef {str(PodRoleType.INSPECT_AUX_PASS)} fill:#fff,color:#000,stroke-dasharray: 5 5')
+        mermaid_graph.append('classDef pea fill:#009999,stroke:#1E6E73')
+        mermaid_str = '\n'.join(mermaid_graph)
+
+        image_type = 'svg'
+        if output and output.endswith('jpg'):
+            image_type = 'jpg'
+
+        url = op_flow._mermaid_to_url(mermaid_str, image_type)
+        showed = False
+        if inline_display:
+            try:
+                from IPython.display import display, Image
+                from IPython.utils import io
+
+                display(Image(url=url))
+                showed = True
+            except:
+                # no need to panic users
+                pass
+
+        if output:
+            op_flow._download_mermaid_url(url, output)
+        elif not showed:
+            op_flow.logger.info(f'flow visualization: {url}')
+
+        return self
+
+    def _mermaid_to_url(self, mermaid_str, img_type) -> str:
+        """
+        Rendering the current flow as a url points to a SVG, it needs internet connection
+        :param kwargs: keyword arguments of :py:meth:`to_mermaid`
+        :return: the url points to a SVG
+        """
+        if img_type == 'jpg':
+            img_type = 'img'
+
+        encoded_str = base64.b64encode(bytes(mermaid_str, 'utf-8')).decode('utf-8')
+
+        return f'https://mermaid.ink/{img_type}/{encoded_str}'
+
+    def _download_mermaid_url(self, mermaid_url, output) -> None:
+        """
+        Rendering the current flow as a jpg image, this will call :py:meth:`to_mermaid` and it needs internet connection
+        :param path: the file path of the image
+        :param kwargs: keyword arguments of :py:meth:`to_mermaid`
+        :return:
+        """
+        try:
+            req = Request(mermaid_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with open(output, 'wb') as fp:
+                fp.write(urlopen(req).read())
+        except:
+            self.logger.error('can not download image, please check your graph and the network connections')
 
     def dry_run(self, **kwargs):
         """Send a DRYRUN request to this flow, passing through all pods in this flow,
@@ -770,7 +944,7 @@ class Flow:
         for k, v in self._pod_nodes.items():
             swarm_yml['services'][k] = {
                 'command': v.to_cli_command(),
-                'deploy': {'replicas': 1}
+                'deploy': {'parallel': 1}
             }
 
         yaml.dump(swarm_yml, path)
@@ -804,3 +978,6 @@ class Flow:
     def use_rest_gateway(self):
         """Change to use REST gateway for IO """
         self._common_kwargs['rest_api'] = True
+
+    # for backward support
+    join = needs

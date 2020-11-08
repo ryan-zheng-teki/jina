@@ -3,12 +3,15 @@ __license__ = "Apache-2.0"
 
 import sys
 import time
+from typing import Sequence
 
 from ...helper import colored
-from ...logging import profile_logger
+from ...logging import profile_logger, default_logger
+from ...logging.profile import TimeContext
+from ...proto import jina_pb2
 
 
-class ProgressBar:
+class ProgressBar(TimeContext):
     """A simple progress bar
 
     Example:
@@ -26,10 +29,9 @@ class ProgressBar:
         :param bar_len: total length of the bar
         :param task_name: the name of the task, will be displayed in front of the bar
         """
+        super().__init__(task_name, logger)
         self.bar_len = bar_len
-        self.task_name = task_name
         self.num_docs = 0
-        self.logger = logger
         self.batch_unit = batch_unit
 
     def update(self, progress: int = None, *args, **kwargs) -> None:
@@ -39,7 +41,7 @@ class ProgressBar:
         """
         self.num_reqs += 1
         sys.stdout.write('\r')
-        elapsed = time.perf_counter() - self.start_time
+        elapsed = time.perf_counter() - self.start
         num_bars = self.num_reqs % self.bar_len
         num_bars = self.bar_len if not num_bars and self.num_reqs else max(num_bars, 1)
         if progress:
@@ -59,27 +61,76 @@ class ProgressBar:
         if num_bars == self.bar_len:
             sys.stdout.write('\n')
         sys.stdout.flush()
-        profile_logger.debug({'num_bars': num_bars,
-                              'num_reqs': self.num_reqs,
-                              'bar_len': self.bar_len,
-                              'progress': num_bars / self.bar_len,
-                              'task_name': self.task_name,
-                              'qps': self.num_reqs / elapsed,
-                              'speed': (self.num_docs if self.num_docs > 0 else self.num_reqs) / elapsed,
-                              'speed_unit': ('Documents' if self.num_docs > 0 else 'Requests'),
-                              'elapsed': elapsed})
+        profile_logger.info({'num_bars': num_bars,
+                             'num_reqs': self.num_reqs,
+                             'bar_len': self.bar_len,
+                             'progress': num_bars / self.bar_len,
+                             'task_name': self.task_name,
+                             'qps': self.num_reqs / elapsed,
+                             'speed': (self.num_docs if self.num_docs > 0 else self.num_reqs) / elapsed,
+                             'speed_unit': ('Documents' if self.num_docs > 0 else 'Requests'),
+                             'elapsed': elapsed})
 
     def __enter__(self):
-        self.start_time = time.perf_counter()
+        super().__enter__()
         self.num_reqs = -1
         self.num_docs = 0
         self.update()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        elapsed = time.perf_counter() - self.start_time
+    def _enter_msg(self):
+        pass
+
+    def _exit_msg(self):
         if self.num_docs > 0:
-            speed = self.num_docs / elapsed
+            speed = self.num_docs / self.duration
         else:
-            speed = self.num_reqs / elapsed
-        sys.stdout.write('\t%s\n' % colored(f'✅ done in ⏱ {elapsed:3.1f}s 🐎 {speed:3.1f}/s', 'green'))
+            speed = self.num_reqs / self.duration
+        sys.stdout.write('\t%s\n' % colored(f'✅ done in ⏱ {self.readable_duration} 🐎 {speed:3.1f}/s', 'green'))
+
+
+def pprint_routes(routes: Sequence['jina_pb2.Route'],
+                  status: 'jina_pb2.Status' = None,
+                  stack_limit: int = 3):
+    """Pretty print routes with :mod:`prettytable`, fallback to :func:`print`
+
+    :param routes: list of :class:`jina_pb2.Route` objects from Envelop
+    :param status: the :class:`jina_pb2.Status` object
+    :param stack_limit: traceback limit
+    :return:
+    """
+    from textwrap import fill
+
+    header = [colored(v, attrs=['bold']) for v in ('Pod', 'Time', 'Exception')]
+
+    try:
+        from prettytable import PrettyTable, ALL
+        table = PrettyTable(field_names=header, align='l', hrules=ALL)
+        add_row = table.add_row
+        visualize = print
+    except (ModuleNotFoundError, ImportError):
+        default_logger.warning('you may want to pip install "jina[prettytable]" for '
+                               'better visualization')
+        # poorman solution
+        table = []
+
+        def add_row(x):
+            for h, y in zip(header, x):
+                table.append(f'{h}\n{y}\n{"-" * 10}')
+
+        def visualize(x):
+            print('\n'.join(x))
+
+    for route in routes:
+        status_icon = '🟢'
+        if route.status.code == jina_pb2.Status.ERROR:
+            status_icon = '🔴'
+        elif route.status.code == jina_pb2.Status.ERROR_CHAINED:
+            status_icon = '⚪'
+
+        add_row([f'{status_icon} {route.pod}',
+                 f'{route.start_time.ToMilliseconds() - routes[0].start_time.ToMilliseconds()}ms',
+                 fill(''.join(route.status.exception.stacks[-stack_limit:]), width=50,
+                      break_long_words=False, replace_whitespace=False)])
+
+    visualize(table)

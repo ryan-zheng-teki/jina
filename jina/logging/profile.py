@@ -5,15 +5,16 @@ import time
 from collections import defaultdict
 from functools import wraps
 
-from ..helper import colored
+
+from ..helper import colored, get_readable_size, get_readable_time
 
 if False:
     # fix type-hint complain for sphinx and flake
-    import logging
+    from jina.logging import JinaLogger
 
 
 def used_memory(unit: int = 1024 * 1024 * 1024) -> float:
-    """Get the memory usage of the current process and all sub-processes.
+    """Get the memory usage of the current process.
 
     :param unit: unit of the memory, default in Gigabytes
     """
@@ -25,6 +26,14 @@ def used_memory(unit: int = 1024 * 1024 * 1024) -> float:
         default_logger.error('module "resource" can not be found and you are likely running it on Windows, '
                              'i will return 0')
         return 0
+
+
+def used_memory_readable() -> str:
+    """ Get the memory usage of the current process in a human-readable format
+
+    :return:
+    """
+    return get_readable_size(used_memory(1))
 
 
 def profiling(func):
@@ -45,14 +54,14 @@ def profiling(func):
     @wraps(func)
     def arg_wrapper(*args, **kwargs):
         start_t = time.perf_counter()
-        start_mem = used_memory(unit=1024 * 1024)
+        start_mem = used_memory(unit=1)
         r = func(*args, **kwargs)
         elapsed = time.perf_counter() - start_t
-        end_mem = used_memory(unit=1024 * 1024)
+        end_mem = used_memory(unit=1)
         # level_prefix = ''.join('-' for v in inspect.stack() if v and v.index is not None and v.index >= 0)
         level_prefix = ''
-        mem_status = 'memory Δ %4.2fMB %4.2fMB -> %4.2fMB' % (end_mem - start_mem, start_mem, end_mem)
-        default_logger.info('%s%s time: %3.3fs %s' % (level_prefix, func.__qualname__, elapsed, mem_status))
+        mem_status = f'memory Δ {get_readable_size(end_mem - start_mem)} {get_readable_size(start_mem)} -> {get_readable_size(end_mem)}'
+        default_logger.info(f'{level_prefix} {func.__qualname__} time: {elapsed}s {mem_status}')
         return r
 
     return arg_wrapper
@@ -104,10 +113,12 @@ class TimeDict:
 class TimeContext:
     """Timing a code snippet with a context manager """
 
-    def __init__(self, msg: str, logger: 'logging.Logger' = None):
+    time_attrs = ['years', 'months', 'days', 'hours', 'minutes', 'seconds']
+
+    def __init__(self, task_name: str, logger: 'JinaLogger' = None):
         """
 
-        :param msg: the context/message
+        :param task_name: the context/message
         :param logger: use existing logger or use naive :func:`print`
 
         Example:
@@ -119,21 +130,30 @@ class TimeContext:
                 do_busy()
 
         """
-        self._msg = msg
+        self.task_name = task_name
         self._logger = logger
         self.duration = 0
 
     def __enter__(self):
         self.start = time.perf_counter()
-        if self._logger:
-            self._logger.info(self._msg + '...')
-        else:
-            print(self._msg, end=' ...\t', flush=True)
+        self._enter_msg()
         return self
+
+    def _enter_msg(self):
+        if self._logger:
+            self._logger.info(self.task_name + '...')
+        else:
+            print(self.task_name, end=' ...\t', flush=True)
 
     def __exit__(self, typ, value, traceback):
         self.duration = time.perf_counter() - self.start
+
+        self.readable_duration = get_readable_time(seconds=self.duration)
+
+        self._exit_msg()
+
+    def _exit_msg(self):
         if self._logger:
-            self._logger.info('%s takes %3.3f secs' % (self._msg, self.duration))
+            self._logger.info(f'{self.task_name} takes {self.readable_duration} ({self.duration:.2f}s)')
         else:
-            print(colored('    [%3.3f secs]' % self.duration, 'green'), flush=True)
+            print(colored(f'    {self.readable_duration} ({self.duration:.2f}s)', 'green'), flush=True)

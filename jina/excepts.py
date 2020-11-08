@@ -1,11 +1,15 @@
+""" This modules defines all kinds of exceptions raised in jina """
+
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
-
-""" This modules defines all kinds of exceptions raised in jina """
 
 
 class NoExplicitMessage(Exception):
     """Waiting until all partial messages are received"""
+
+
+class ChainedPodException(Exception):
+    """Chained exception from the last Pod"""
 
 
 class MismatchedVersion(SystemError):
@@ -14,6 +18,10 @@ class MismatchedVersion(SystemError):
 
 class ExecutorFailToLoad(SystemError):
     """When the executor can not be loaded in pea/pod"""
+
+
+class PeaFailToStart(SystemError):
+    """When pea/pod is failed to started"""
 
 
 class MemoryOverHighWatermark(Exception):
@@ -76,6 +84,10 @@ class BadClient(Exception):
     """A wrongly defined grpc client, can not communicate with jina server correctly """
 
 
+class BadClientCallback(BadClient):
+    """Error in the callback function on the client side"""
+
+
 class BadPersistantFile(Exception):
     """Bad or broken dump file that can not be deserialized with ``pickle.load``"""
 
@@ -90,3 +102,40 @@ class GRPCServerError(Exception):
 
 class GatewayPartialMessage(Exception):
     """Gateway receives a multi-part message but it can not handle it"""
+
+
+class UndefinedModel(Exception):
+    """Any time a non-defined model is tried to be used """
+
+
+class MongoDBException(Exception):
+    """ Any errors raised by MongoDb """
+
+
+class TimedOutException(Exception):
+    """ Errors raised for timeout operations """
+
+
+class DockerLoginFailed(Exception):
+    """ Exception to raise for docker hub login failures """
+
+
+class ModelCheckpointNotExist(Exception):
+    """ Exception to raise for executors depending on pretrained model files when they do not exist """
+
+
+class PretrainedModelFileDoesNotExist(ModelCheckpointNotExist):
+    """ Depreciated, used in the hub executors
+
+    TODO: to be removed after hub executors uses ModelCheckpointNotExist
+    """
+
+
+class CompressionRateTooLow(Exception):
+    """ Compression rate is too low, no need to compression
+
+    """
+
+
+class BadDocID(Exception):
+    """ Exception when user give a non-hex string as the doc id """

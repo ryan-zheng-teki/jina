@@ -3,11 +3,11 @@ __license__ = "Apache-2.0"
 
 # do not change this line manually
 # this is managed by git tag and updated on every release
-__version__ = '0.3.7'
+__version__ = '0.7.5'
 
 # do not change this line manually
 # this is managed by proto/build-proto.sh and updated on every execution
-__proto_version__ = '0.0.46'
+__proto_version__ = '0.0.75'
 
 import platform
 import sys
@@ -25,7 +25,6 @@ if sys.version_info >= (3, 8, 0) and platform.system() == 'Darwin':
     set_start_method('fork')
 
 from datetime import datetime
-import random
 from types import SimpleNamespace
 import os
 
@@ -39,43 +38,42 @@ __uptime__ = datetime.now().strftime('%Y%m%d%H%M%S')
 # 2. grep -ohE "\'JINA_.*?\'" **/*.py | sort -u | sed "s/$/,/g"
 # 3. copy all lines EXCEPT the first (which is the grep command in the last line)
 __jina_env__ = ('JINA_ARRAY_QUANT',
+                'JINA_BINARY_DELIMITER',
                 'JINA_CONTRIB_MODULE',
                 'JINA_CONTRIB_MODULE_IS_LOADING',
                 'JINA_CONTROL_PORT',
+                'JINA_DB_COLLECTION',
+                'JINA_DB_HOSTNAME',
+                'JINA_DB_NAME',
+                'JINA_DB_PASSWORD',
+                'JINA_DB_USERNAME',
                 'JINA_DEFAULT_HOST',
+                'JINA_DISABLE_UVLOOP',
                 'JINA_EXECUTOR_WORKDIR',
                 'JINA_FULL_CLI',
                 'JINA_IPC_SOCK_TMP',
-                'JINA_LOG_FILE',
-                'JINA_LOG_LONG',
+                'JINA_LOG_CONFIG',
                 'JINA_LOG_NO_COLOR',
-                'JINA_LOG_PROFILING',
-                'JINA_LOG_SSE',
-                'JINA_LOG_VERBOSITY',
                 'JINA_POD_NAME',
                 'JINA_PROFILING',
+                'JINA_RANDOM_PORTS',
                 'JINA_SOCKET_HWM',
-                'JINA_STACK_CONFIG',
-                'JINA_TEST_CONTAINER',
                 'JINA_TEST_GPU',
                 'JINA_TEST_PRETRAINED',
                 'JINA_VCS_VERSION',
-                'JINA_VERSION',
-                'JINA_WARN_UNNAMED',
-                'JINA_BINARY_DELIMITER',
-                'JINA_DISABLE_UVLOOP')
+                'JINA_WARN_UNNAMED')
 
 __default_host__ = os.environ.get('JINA_DEFAULT_HOST', '0.0.0.0')
 __ready_msg__ = 'ready and listening'
 __stop_msg__ = 'terminated'
+__unable_to_load_pretrained_model_msg__ = 'Executor depending on pretrained model file could not find the pretrained model'
 __binary_delimiter__ = os.environ.get('JINA_BINARY_DELIMITER', '460841a0a8a430ae25d9ad7c1f048c57').encode()
 
 JINA_GLOBAL = SimpleNamespace()
 JINA_GLOBAL.imported = SimpleNamespace()
 JINA_GLOBAL.imported.executors = False
 JINA_GLOBAL.imported.drivers = False
-JINA_GLOBAL.stack = SimpleNamespace()
-JINA_GLOBAL.stack.id = random.randint(0, 10000)
+JINA_GLOBAL.imported.hub = False
 JINA_GLOBAL.logserver = SimpleNamespace()
 
 
@@ -91,7 +89,8 @@ def import_classes(namespace: str, targets=None,
     :param import_once: import everything only once, to avoid repeated import
     """
 
-    import os, sys
+    import os, re
+    from .logging import default_logger
 
     if namespace == 'jina.executors':
         import_type = 'ExecutorType'
@@ -101,31 +100,40 @@ def import_classes(namespace: str, targets=None,
         import_type = 'DriverType'
         if import_once and JINA_GLOBAL.imported.drivers:
             return
+    elif namespace == 'jina.hub':
+        import_type = 'ExecutorType'
+        if import_once and JINA_GLOBAL.imported.hub:
+            return
     else:
         raise TypeError(f'namespace: {namespace} is unrecognized')
 
     from setuptools import find_packages
     import pkgutil
     from pkgutil import iter_modules
-    path = os.path.dirname(pkgutil.get_loader(namespace).path)
+
+    try:
+        path = os.path.dirname(pkgutil.get_loader(namespace).path)
+    except AttributeError:
+        if namespace == 'jina.hub':
+            default_logger.debug(f'hub submodule is not initialized. Please try "git submodule update --init"')
+        return {}
 
     modules = set()
 
     for info in iter_modules([path]):
-        if not info.ispkg:
+        if (namespace != 'jina.hub' and not info.ispkg) or (namespace == 'jina.hub' and info.ispkg):
             modules.add('.'.join([namespace, info.name]))
 
     for pkg in find_packages(path):
         modules.add('.'.join([namespace, pkg]))
         pkgpath = path + '/' + pkg.replace('.', '/')
-        if sys.version_info.major == 2 or (sys.version_info.major == 3 and sys.version_info.minor < 6):
-            for _, name, ispkg in iter_modules([pkgpath]):
-                if not ispkg:
-                    modules.add('.'.join([namespace, pkg, name]))
-        else:
-            for info in iter_modules([pkgpath]):
-                if not info.ispkg:
-                    modules.add('.'.join([namespace, pkg, info.name]))
+        for info in iter_modules([pkgpath]):
+            if (namespace != 'jina.hub' and not info.ispkg) or (namespace == 'jina.hub' and info.ispkg):
+                modules.add('.'.join([namespace, pkg, info.name]))
+
+    # filter
+    ignored_module_pattern = r'\.tests|\.api|\.bump_version'
+    modules = {m for m in modules if not re.findall(ignored_module_pattern, m)}
 
     from collections import defaultdict
     load_stat = defaultdict(list)
@@ -186,13 +194,22 @@ def import_classes(namespace: str, targets=None,
         print_load_table(load_stat)
     else:
         if bad_imports:
-            from .logging import default_logger
-            default_logger.error(f'theses modules or classes can not be imported {bad_imports}')
+            if namespace != 'jina.hub':
+                default_logger.error(
+                    f'theses modules or classes can not be imported {bad_imports}. '
+                    f'You can use `jina check` to list all executors and drivers')
+            else:
+                default_logger.warning(
+                    f'due to the missing dependencies or bad implementations, {bad_imports} can not be imported '
+                    f'if you are using these executors/drivers, they wont work. '
+                    f'You can use `jina check` to list all executors and drivers')
 
     if namespace == 'jina.executors':
         JINA_GLOBAL.imported.executors = True
     elif namespace == 'jina.drivers':
         JINA_GLOBAL.imported.drivers = True
+    elif namespace == 'jina.hub':
+        JINA_GLOBAL.imported.hub = True
 
     return depend_tree
 
@@ -200,25 +217,26 @@ def import_classes(namespace: str, targets=None,
 # driver first, as executor may contain driver
 import_classes('jina.drivers', show_import_table=False, import_once=True)
 import_classes('jina.executors', show_import_table=False, import_once=True)
+import_classes('jina.hub', show_import_table=False, import_once=True)
 
 # manually install the default signal handler
 import signal
 
 signal.signal(signal.SIGINT, signal.default_int_handler)
 
-# !/usr/bin/env python
-try:
-    import resource as res
-except ImportError:  # Windows
-    res = None
 
-
-def raise_nofile(nofile_atleast=4096):
+def set_nofile(nofile_atleast=4096):
     """
     sets nofile soft limit to at least 4096, useful for running matlplotlib/seaborn on
     parallel executing plot generators vs. Ubuntu default ulimit -n 1024 or OS X El Captian 256
     temporary setting extinguishing with Python session.
     """
+
+    try:
+        import resource as res
+    except ImportError:  # Windows
+        res = None
+
     from .logging import default_logger
     if res is None:
         return (None,) * 2
@@ -247,4 +265,4 @@ def raise_nofile(nofile_atleast=4096):
     return soft, hard
 
 
-raise_nofile()
+set_nofile()

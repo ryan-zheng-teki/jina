@@ -1,11 +1,9 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-import logging
-import os
+import time
 
 from . import default_logger
-from .queue import __sse_queue__, __profile_queue__
 from .. import JINA_GLOBAL, __version__
 from ..helper import yaml
 
@@ -13,10 +11,8 @@ from ..helper import yaml
 def start_sse_logger(server_config_path: str, flow_yaml: str = None):
     """Start a logger that emits server-side event from the log queue, so that one can use a browser to monitor the logs
 
-    :param host: host address of the server
-    :param port: port of the server
-    :param endpoint_log: endpoint for the log
-    :param endpoint_yaml: endpoint for the yaml
+    :param server_config_path: Path to the server configuration file path
+    :param flow_yaml: Flow yaml description
 
     Example:
 
@@ -51,39 +47,35 @@ def start_sse_logger(server_config_path: str, flow_yaml: str = None):
     JINA_GLOBAL.logserver.address = f'http://{_config["host"]}:{_config["port"]}'
 
     JINA_GLOBAL.logserver.ready = JINA_GLOBAL.logserver.address + \
-        _config['endpoints']['ready']
+                                  _config['endpoints']['ready']
     JINA_GLOBAL.logserver.shutdown = JINA_GLOBAL.logserver.address + \
-        _config['endpoints']['shutdown']
+                                     _config['endpoints']['shutdown']
 
     app = Flask(__name__)
     CORS(app)
     server = WSGIServer((_config['host'], _config['port']), app, log=None)
 
-    def _log_stream():
-        while True:
-            try:
-                gevent.sleep(0)
-                message = __sse_queue__.get()
-                yield f'data: {message.msg}\n\n'
-            except EOFError:
-                yield 'LOG ENDS\n\n'
-                break
+    def _log_stream(path):
+        import glob
+        # fluentd creates files under this path with some tag based on day, so as temp solution,
+        # just get the first file matching this patter once it appears
+        while len(glob.glob(f'{path}*.log')) == 0:
+            time.sleep(0.1)
 
-    def _profile_stream():
-        while True:
-            try:
-                gevent.sleep(0)
-                message = __profile_queue__.get()
-                yield f'data: {message.msg}\n\n'
-            except EOFError:
-                yield 'PROFILE ENDS\n\n'
-                break
-
+        file = glob.glob(f'{path}*.log')[0]
+        with open(file) as fp:
+            fp.seek(0, 2)
+            while True:
+                line = fp.readline().strip()
+                if line:
+                    yield f'data: {line}\n\n'
+                else:
+                    time.sleep(0.1)
 
     @app.route(_config['endpoints']['log'])
     def get_log():
         """Get the logs, endpoint `/log/stream`  """
-        return Response(_log_stream(), mimetype="text/event-stream")
+        return Response(_log_stream(_config['files']['log']), mimetype="text/event-stream")
 
     @app.route(_config['endpoints']['yaml'])
     def get_yaml():
@@ -93,13 +85,13 @@ def start_sse_logger(server_config_path: str, flow_yaml: str = None):
     @app.route(_config['endpoints']['profile'])
     def get_profile():
         """Get the profile logs, endpoint `/profile/stream`  """
-        return Response(_profile_stream(), mimetype='text/event-stream')
+        return Response(_log_stream(_config['files']['profile']), mimetype='text/event-stream')
 
     @app.route(_config['endpoints']['podapi'])
     def get_podargs():
         """Get the default args of a pod"""
 
-        from jina.main.parser import set_pod_parser
+        from ..parser import set_pod_parser
         from argparse import _StoreAction, _StoreTrueAction
         port_attr = ('help', 'choices', 'default')
         d = {}
@@ -128,5 +120,6 @@ def start_sse_logger(server_config_path: str, flow_yaml: str = None):
 
     try:
         server.serve_forever()
+        gevent.get_hub().join()
     except Exception as ex:
         default_logger.error(ex)

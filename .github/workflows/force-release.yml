@@ -14,6 +14,7 @@ jobs:
         with:
           token: ${{ secrets.JINA_DEV_BOT }}
           fetch-depth: 100  # means max contribute history is limited to 100 lines
+          submodules: true
       - uses: actions/setup-python@v1
         with:
           python-version: 3.7
@@ -22,10 +23,11 @@ jobs:
           git fetch --depth=1 origin +refs/tags/*:refs/tags/*
           npm install git-release-notes
           pip install twine wheel
-      - run: ./release.sh
+      - run: ./scripts/release.sh
         env:
           TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+          JINA_SLACK_WEBHOOK: ${{ secrets.JINA_SLACK_WEBHOOK }}
       - if: failure()
         run: echo "nothing to release"
       - name: bumping master version

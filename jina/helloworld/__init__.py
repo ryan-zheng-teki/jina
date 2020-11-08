@@ -40,7 +40,7 @@ def hello_world(args):
     # this envs are referred in index and query flow YAMLs
     os.environ['RESOURCE_DIR'] = resource_filename('jina', 'resources')
     os.environ['SHARDS'] = str(args.shards)
-    os.environ['REPLICAS'] = str(args.replicas)
+    os.environ['PARALLEL'] = str(args.parallel)
     os.environ['HW_WORKDIR'] = args.workdir
     os.environ['WITH_LOGSERVER'] = str(args.logserver)
 
@@ -49,7 +49,7 @@ def hello_world(args):
 
     # now comes the real work
     # load index flow from a YAML file
-    f = Flow.load_config(args.index_yaml_path)
+    f = Flow.load_config(args.uses_index)
     # run it!
     with f:
         f.index_ndarray(targets['index']['data'], batch_size=args.index_batch_size)
@@ -59,11 +59,12 @@ def hello_world(args):
                                 attrs=['underline', 'bold', 'reverse']))
 
     # now load query flow from another YAML file
-    f = Flow.load_config(args.query_yaml_path)
+    f = Flow.load_config(args.uses_query)
     # run it!
     with f:
         f.search_ndarray(targets['query']['data'], shuffle=True, size=args.num_query,
-                       output_fn=print_result, top_k=args.top_k, batch_size=args.query_batch_size)
+                         output_fn=print_result, batch_size=args.query_batch_size,
+                         top_k=args.top_k)
 
     # write result to html
     write_html(os.path.join(args.workdir, 'hello-world.html'))

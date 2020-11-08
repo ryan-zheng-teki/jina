@@ -2,13 +2,13 @@ __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
 import time
-from typing import Iterator, Callable, Union
+from typing import Iterator, Callable, Union, Sequence, Optional
 
 from . import request
 from .grpc import GrpcClient
-from .helper import ProgressBar
+from .helper import ProgressBar, pprint_routes
 from ...enums import ClientMode
-from ...excepts import BadClient
+from ...excepts import BadClient, BadClientCallback
 from ...logging import default_logger
 from ...logging.profile import TimeContext
 from ...proto import jina_pb2
@@ -56,7 +56,7 @@ class PyClient(GrpcClient):
         return self._mode
 
     @mode.setter
-    def mode(self, value: ClientMode):
+    def mode(self, value: ClientMode) -> None:
         if isinstance(value, ClientMode):
             self._mode = value
             self.args.mode = value
@@ -64,7 +64,7 @@ class PyClient(GrpcClient):
             raise ValueError(f'{value} must be one of {ClientMode}')
 
     @staticmethod
-    def check_input(input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None):
+    def check_input(input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None) -> None:
         """Validate the input_fn and print the first request if success
 
         :param input_fn: the input function
@@ -77,7 +77,7 @@ class PyClient(GrpcClient):
         try:
             r = next(getattr(request, 'index')(**kwargs))
             if r is not None:
-                default_logger.success(f'input_fn is valid and the first request is as follows:\n{r}')
+                default_logger.success(f'input_fn is valid')
             else:
                 raise TypeError
         except:
@@ -101,44 +101,39 @@ class PyClient(GrpcClient):
         req_iter = getattr(request, str(self.mode).lower())(**kwargs)
         return self._stub.CallUnary(next(req_iter))
 
-    def call(self, callback: Callable[['jina_pb2.Message'], None] = None, **kwargs) -> None:
+    def call(self, callback: Callable[['jina_pb2.Request'], None] = None,
+             on_error: Callable[[Sequence['jina_pb2.Route'],
+                                 Optional['jina_pb2.Status']], None] = pprint_routes,
+             **kwargs) -> None:
         """ Calling the server, better use :func:`start` instead.
 
-        :param callback: a callback function, invoke after every response is received
+        :param callback: a callback function, invoke after every success response is received
+        :param on_error: a callback function on error, invoke on every error response
         """
         # take the default args from client
         _kwargs = vars(self.args)
         _kwargs['data'] = self.input_fn
         # override by the caller-specific kwargs
-        for k in _kwargs.keys():
-            if k in kwargs:
-                _kwargs[k] = kwargs[k]
+        _kwargs.update(kwargs)
 
         tname = str(self.mode).lower()
         if 'mode' in kwargs:
             tname = str(kwargs['mode']).lower()
 
-        if 'mime_type' not in kwargs:
-            self.logger.warning('starting from v0.2.0, '
-                                'the best practice of sending binary data is with "mime_type". '
-                                'when not given then MIME sniff (based on libmagic) will be used')
-
         req_iter = getattr(request, tname)(**_kwargs)
-        # next(req_iter)
 
         with ProgressBar(task_name=tname) as p_bar, TimeContext(tname):
             for resp in self._stub.Call(req_iter):
                 if resp.status.code >= jina_pb2.Status.ERROR:
-                    self.logger.error(f'callback() may not work properly '
-                                      f'due to the bad response: {resp.status.description}')
-                    self.logger.error(resp.status.details)
-                if callback:
+                    on_error(resp.routes, resp.status)
+                elif callback:
                     try:
                         if self.args.callback_on_body:
                             resp = getattr(resp, resp.WhichOneof('body'))
                         callback(resp)
                     except Exception as ex:
-                        raise BadClient('error in client\'s callback: %s' % ex)
+                        raise BadClientCallback(f'uncatched exception in callback '
+                                                f'"{callback.__name__}()": {repr(ex)}')
                 p_bar.update(self.args.batch_size)
 
     @property
@@ -152,7 +147,7 @@ class PyClient(GrpcClient):
             raise BadClient('input_fn is empty or not set')
 
     @input_fn.setter
-    def input_fn(self, bytes_gen: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable]):
+    def input_fn(self, bytes_gen: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable]) -> None:
         if self._input_fn:
             self.logger.warning('input_fn is not empty, overrided')
         if hasattr(bytes_gen, '__call__'):
@@ -194,24 +189,24 @@ class PyClient(GrpcClient):
 
         return False
 
-    def train(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
-              output_fn: Callable[['jina_pb2.Message'], None] = None, **kwargs):
+    def train(self, input_fn: Union[Iterator[Union['jina_pb2.Document', bytes]], Callable] = None,
+              output_fn: Callable[['jina_pb2.Request'], None] = None, **kwargs) -> None:
         self.mode = ClientMode.TRAIN
         self.input_fn = input_fn
         if not self.args.skip_dry_run:
             self.dry_run(as_request='train')
         self.start(output_fn, **kwargs)
 
-    def search(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
-               output_fn: Callable[['jina_pb2.Message'], None] = None, **kwargs):
+    def search(self, input_fn: Union[Iterator[Union['jina_pb2.Document', bytes]], Callable] = None,
+               output_fn: Callable[['jina_pb2.Request'], None] = None, **kwargs) -> None:
         self.mode = ClientMode.SEARCH
         self.input_fn = input_fn
         if not self.args.skip_dry_run:
             self.dry_run(as_request='search')
         self.start(output_fn, **kwargs)
 
-    def index(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
-              output_fn: Callable[['jina_pb2.Message'], None] = None, **kwargs):
+    def index(self, input_fn: Union[Iterator[Union['jina_pb2.Document', bytes]], Callable] = None,
+              output_fn: Callable[['jina_pb2.Request'], None] = None, **kwargs) -> None:
         self.mode = ClientMode.INDEX
         self.input_fn = input_fn
         if not self.args.skip_dry_run:

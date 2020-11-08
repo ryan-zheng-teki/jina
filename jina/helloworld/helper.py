@@ -20,8 +20,8 @@ def print_result(resp):
     for d in resp.search.docs:
         vi = d.uri
         result_html.append(f'<tr><td><img src="{vi}"/></td><td>')
-        for kk in d.topk_results:
-            kmi = kk.match_doc.uri
+        for kk in d.matches:
+            kmi = kk.uri
             result_html.append(f'<img src="{kmi}" style="opacity:{kk.score.value}"/>')
             # k['score']['explained'] = json.loads(kk.score.explained)
         result_html.append('</td></tr>\n')
@@ -39,7 +39,7 @@ def write_html(html_path):
     try:
         webbrowser.open(url_html_path, new=2)
     except:
-        pass
+        pass  # intentional pass, browser support isn't cross-platform
     finally:
         default_logger.success(f'You should see a "hello-world.html" opened in your browser, '
                                f'if not you may open {url_html_path} manually')

@@ -4,7 +4,7 @@
 
 |
 
-Welcome to Jina Documentations!
+Welcome to Jina Documentation!
 ===============================
 
 .. toctree::
@@ -14,6 +14,7 @@ Welcome to Jina Documentations!
    chapters/install/via-pip
    chapters/install/via-docker
    chapters/install/on-rasp-linux
+   chapters/install/on-x
    chapters/install/upgrade
    chapters/install/autocomplete
 
@@ -24,10 +25,11 @@ Welcome to Jina Documentations!
 
    chapters/helloworld/index
    chapters/101/.sphinx
-   chapters/flow/README
+   chapters/flow/index
    chapters/io/index
    chapters/hub/index
    chapters/remote/index
+   chapters/logging/index
    chapters/dashboard/index
    chapters/cli/exit
 
@@ -43,6 +45,7 @@ Welcome to Jina Documentations!
    chapters/restapi/index
    chapters/envs
    chapters/api_schema
+   chapters/prevent_duplicate_indexing/index
 
 .. toctree::
    :maxdepth: 2

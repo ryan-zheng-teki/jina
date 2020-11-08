@@ -4,6 +4,7 @@ __license__ = "Apache-2.0"
 import os
 import pickle
 import re
+import subprocess
 import tempfile
 import uuid
 from datetime import datetime
@@ -14,14 +15,15 @@ from typing import Dict, Any, Union, TypeVar, Type, TextIO, List
 import ruamel.yaml.constructor
 from ruamel.yaml import StringIO
 
-from .decorators import as_train_method, as_update_method, store_init_kwargs
+from .decorators import as_train_method, as_update_method, store_init_kwargs, as_aggregate_method, wrap_func
 from .metas import get_default_metas, fill_metas_with_defaults
 from ..excepts import EmptyExecutorYAML, BadWorkspace, BadPersistantFile, NoDriverForRequest, UnattachedDriver
-from ..helper import yaml, PathImporter, expand_dict, expand_env_var, valid_yaml_path
-from ..logging.base import get_logger
+from ..helper import yaml, PathImporter, expand_dict, expand_env_var, get_local_config_source
+from ..logging import JinaLogger
 from ..logging.profile import TimeContext
 
 if False:
+    from ..peapods.pea import BasePea
     from ..drivers import BaseDriver
 
 __all__ = ['BaseExecutor', 'AnyExecutor', 'ExecutorType']
@@ -31,7 +33,7 @@ AnyExecutor = TypeVar('AnyExecutor', bound='BaseExecutor')
 # some variables may be self-referred and they must be resolved at here
 _ref_desolve_map = SimpleNamespace()
 _ref_desolve_map.__dict__['metas'] = SimpleNamespace()
-_ref_desolve_map.__dict__['metas'].__dict__['replica_id'] = 0
+_ref_desolve_map.__dict__['metas'].__dict__['pea_id'] = 0
 _ref_desolve_map.__dict__['metas'].__dict__['separated_workspace'] = False
 
 
@@ -59,24 +61,17 @@ class ExecutorType(type):
 
     @staticmethod
     def register_class(cls):
-        prof_funcs = ['train', 'encode', 'add', 'query', 'craft', 'score']
         update_funcs = ['train', 'add']
         train_funcs = ['train']
-
-        def wrap_func(func_lst, wrapper):
-            for f_name in func_lst:
-                if hasattr(cls, f_name):
-                    setattr(cls, f_name, wrapper(getattr(cls, f_name)))
+        aggregate_funcs = ['evaluate']
 
         reg_cls_set = getattr(cls, '_registered_class', set())
-        if cls.__name__ not in reg_cls_set:
-            # print('reg class: %s' % cls.__name__)
-            cls.__init__ = store_init_kwargs(cls.__init__)
-            # if 'JINA_PROFILING' in os.environ:
-            #     wrap_func(prof_funcs, profiling)
+        if cls.__name__ not in reg_cls_set or getattr(cls, 'force_register', False):
 
-            wrap_func(train_funcs, as_train_method)
-            wrap_func(update_funcs, as_update_method)
+            wrap_func(cls, ['__init__'], store_init_kwargs)
+            wrap_func(cls, train_funcs, as_train_method)
+            wrap_func(cls, update_funcs, as_update_method)
+            wrap_func(cls, aggregate_funcs, as_aggregate_method)
 
             reg_cls_set.add(cls.__name__)
             setattr(cls, '_registered_class', reg_cls_set)
@@ -125,14 +120,28 @@ class BaseExecutor(metaclass=ExecutorType):
     store_args_kwargs = False  #: set this to ``True`` to save ``args`` (in a list) and ``kwargs`` (in a map) in YAML config
 
     def __init__(self, *args, **kwargs):
-        self.logger = get_logger(self.__class__.__name__)
+        if isinstance(args, tuple) and len(args) > 0:
+            self.args = args[0]
+        else:
+            self.args = args
+        self.logger = JinaLogger(self.__class__.__name__)
         self._snapshot_files = []
         self._post_init_vars = set()
         self._last_snapshot_ts = datetime.now()
         self._drivers = {}  # type: Dict[str, List['BaseDriver']]
         self._attached_pea = None
 
-    def _post_init_wrapper(self, _metas: Dict = None, _requests: Dict = None, fill_in_metas: bool = True):
+    def _check_on_gpu(self):
+        if self.on_gpu:
+            try:
+                cuda_version = subprocess.check_output(['nvcc', '--version']).decode()
+                self.logger.success(f'CUDA compiler version: {cuda_version}')
+            except OSError:
+                self.logger.warning(
+                    'on_gpu=True, but you dont have CUDA compatible GPU, i will reset on_gpu=False ')
+                self.on_gpu = False
+
+    def _post_init_wrapper(self, _metas: Dict = None, _requests: Dict = None, fill_in_metas: bool = True) -> None:
         with TimeContext('post initiating, this may take some time', self.logger):
             if fill_in_metas:
                 if not _metas:
@@ -146,6 +155,7 @@ class BaseExecutor(metaclass=ExecutorType):
                 self._fill_requests(_requests)
 
             _before = set(list(vars(self).keys()))
+            self._check_on_gpu()
             self.post_init()
             self._post_init_vars = {k for k in vars(self) if k not in _before}
 
@@ -178,6 +188,8 @@ class BaseExecutor(metaclass=ExecutorType):
                         unresolved_attr = True
                 else:
                     setattr(self, k, v)
+            elif type(getattr(self, k)) == type(v):
+                setattr(self, k, v)
         if not getattr(self, 'name', None):
             _id = str(uuid.uuid4()).split('-')[0]
             _name = f'{self.__class__.__name__}-{_id}'
@@ -250,9 +262,9 @@ class BaseExecutor(metaclass=ExecutorType):
         """ Get the path of the current workspace.
 
         :return: if ``separated_workspace`` is set to ``False`` then ``metas.workspace`` is returned,
-                otherwise the ``metas.replica_workspace`` is returned
+                otherwise the ``metas.pea_workspace`` is returned
         """
-        work_dir = self.replica_workspace if self.separated_workspace else self.workspace  # type: str
+        work_dir = self.pea_workspace if self.separated_workspace else self.workspace  # type: str
         return work_dir
 
     def get_file_from_workspace(self, name: str) -> str:
@@ -260,40 +272,49 @@ class BaseExecutor(metaclass=ExecutorType):
 
         :param name: the name of the file
 
-        :return depending on ``metas.separated_workspace`` the file could be located in ``metas.workspace`` or ``metas.replica_workspace``
+        :return depending on ``metas.separated_workspace`` the file could be located in ``metas.workspace`` or ``metas.pea_workspace``
         """
         Path(self.current_workspace).mkdir(parents=True, exist_ok=True)
         return os.path.join(self.current_workspace, name)
+
+    @property
+    def physical_size(self) -> int:
+        """Return the size of the current workspace in bytes"""
+        root_directory = Path(self.current_workspace)
+        return sum(f.stat().st_size for f in root_directory.glob('**/*') if f.is_file())
 
     def __getstate__(self):
         d = dict(self.__dict__)
         del d['logger']
         for k in self._post_init_vars:
             del d[k]
+        cached = [k for k in d.keys() if k.startswith('CACHED_')]
+        for k in cached:
+            del d[k]
         return d
 
     def __setstate__(self, d):
         self.__dict__.update(d)
-        self.logger = get_logger(self.__class__.__name__)
+        self.logger = JinaLogger(self.__class__.__name__)
         try:
             self._post_init_wrapper(fill_in_metas=False)
         except ImportError as ex:
             self.logger.warning('ImportError is often caused by a missing component, '
                                 'which often can be solved by "pip install" relevant package. %s' % ex, exc_info=True)
 
-    def train(self, *args, **kwargs):
+    def train(self, *args, **kwargs) -> None:
         """
         Train this executor, need to be overrided
         """
         pass
 
-    def touch(self):
+    def touch(self) -> None:
         """Touch the executor and change ``is_updated`` to ``True`` so that one can call :func:`save`. """
         self.is_updated = True
 
     def save(self, filename: str = None) -> bool:
         """
-        Persist data of this executor to the :attr:`workspace` (or :attr:`replica_workspace`). The data could be
+        Persist data of this executor to the :attr:`workspace` (or :attr:`pea_workspace`). The data could be
         a file or collection of files produced/used during an executor run.
 
         These are some of the common data that you might want to persist:
@@ -357,20 +378,20 @@ class BaseExecutor(metaclass=ExecutorType):
         return True
 
     @classmethod
-    def load_config(cls: Type[AnyExecutor], filename: Union[str, TextIO], separated_workspace: bool = False,
-                    replica_id: int = 0) -> AnyExecutor:
+    def load_config(cls: Type[AnyExecutor], source: Union[str, TextIO], separated_workspace: bool = False,
+                    pea_id: int = 0) -> AnyExecutor:
         """Build an executor from a YAML file.
 
         :param filename: the file path of the YAML file or a ``TextIO`` stream to be loaded from
         :param separated_workspace: the dump and data files associated to this executor will be stored separately for
-                each replica, which will be indexed by the ``replica_id``
-        :param replica_id: the id of the storage of this replica, only effective when ``separated_workspace=True``
+                each parallel pea, which will be indexed by the ``pea_id``
+        :param pea_id: the id of the storage of this parallel pea, only effective when ``separated_workspace=True``
         :return: an executor object
         """
-        if not filename: raise FileNotFoundError
-        filename = valid_yaml_path(filename)
+        if not source: raise FileNotFoundError
+        source = get_local_config_source(source)
         # first scan, find if external modules are specified
-        with (open(filename, encoding='utf8') if isinstance(filename, str) else filename) as fp:
+        with (open(source, encoding='utf8') if isinstance(source, str) else source) as fp:
             # ignore all lines start with ! because they could trigger the deserialization of that class
             safe_yml = '\n'.join(v if not re.match(r'^[\s-]*?!\b', v) else v.replace('!', '__tag: ') for v in fp)
             tmp = yaml.load(safe_yml)
@@ -386,16 +407,16 @@ class BaseExecutor(metaclass=ExecutorType):
                         mod = [mod]
 
                     if isinstance(mod, list):
-                        mod = [m if os.path.isabs(m) else os.path.join(os.path.dirname(filename), m) for m in mod]
+                        mod = [m if os.path.isabs(m) else os.path.join(os.path.dirname(source), m) for m in mod]
                         PathImporter.add_modules(*mod)
                     else:
                         raise TypeError(f'{type(mod)!r} is not acceptable, only str or list are acceptable')
 
                 tmp['metas']['separated_workspace'] = separated_workspace
-                tmp['metas']['replica_id'] = replica_id
+                tmp['metas']['pea_id'] = pea_id
 
             else:
-                raise EmptyExecutorYAML(f'{filename} is empty? nothing to read from there')
+                raise EmptyExecutorYAML(f'{source} is empty? nothing to read from there')
 
             tmp = expand_dict(tmp)
             stream = StringIO()
@@ -419,11 +440,11 @@ class BaseExecutor(metaclass=ExecutorType):
         except EOFError:
             raise BadPersistantFile(f'broken file {filename} can not be loaded')
 
-    def close(self):
+    def close(self) -> None:
         """
         Release the resources as executor is destroyed, need to be overrided
         """
-        pass
+        self.logger.close()
 
     def __enter__(self):
         return self
@@ -495,13 +516,13 @@ class BaseExecutor(metaclass=ExecutorType):
     def _get_dump_path_from_config(meta_config: Dict):
         if 'name' in meta_config:
             if meta_config.get('separated_workspace', False) is True:
-                if 'replica_id' in meta_config and isinstance(meta_config['replica_id'], int):
-                    work_dir = meta_config['replica_workspace']
+                if 'pea_id' in meta_config and isinstance(meta_config['pea_id'], int):
+                    work_dir = meta_config['pea_workspace']
                     dump_path = os.path.join(work_dir, f'{meta_config["name"]}.{"bin"}')
                     if os.path.exists(dump_path):
                         return dump_path
                 else:
-                    raise BadWorkspace('separated_workspace=True but replica_id is unset or set to a bad value')
+                    raise BadWorkspace('separated_workspace=True but pea_id is unset or set to a bad value')
             else:
                 dump_path = os.path.join(meta_config.get('workspace', os.getcwd()),
                                          f'{meta_config["name"]}.{"bin"}')
@@ -509,7 +530,7 @@ class BaseExecutor(metaclass=ExecutorType):
                     return dump_path
 
     @staticmethod
-    def _dump_instance_to_yaml(data):
+    def _dump_instance_to_yaml(data) -> Dict[str, Dict]:
         # note: we only save non-default property for the sake of clarity
         _defaults = get_default_metas()
         p = {k: getattr(data, k) for k, v in _defaults.items() if getattr(data, k) != v}
@@ -521,30 +542,18 @@ class BaseExecutor(metaclass=ExecutorType):
             r['metas'] = p
         return r
 
-    def add_driver(self, driver: 'BaseDriver', req_type: str):
-        """ Add a driver to this executor.
-
-        .. warning::
-            This has to be used *before* ``.attach(pea=self)`` to be effective
-
-        :param driver: the driver to add
-        :param req_type: the request type to handle by this driver
-        :return:
-        """
-        if not isinstance(driver, list):
-            driver = [driver]
-        if req_type not in self._drivers:
-            self._drivers[req_type] = []
-        self._drivers[req_type].extend(driver)
-
-    def attach(self, *args, **kwargs):
+    def attach(self, pea: 'BasePea', *args, **kwargs):
         """Attach this executor to a :class:`jina.peapods.pea.BasePea`.
 
         This is called inside the initializing of a :class:`jina.peapods.pea.BasePea`.
         """
         for v in self._drivers.values():
             for d in v:
-                d.attach(executor=self, *args, **kwargs)
+                d.attach(executor=self, pea=pea, *args, **kwargs)
+
+        # replacing the logger to pea's logger
+        if pea and isinstance(getattr(pea, 'logger', None), JinaLogger):
+            self.logger = pea.logger
 
     def __call__(self, req_type, *args, **kwargs):
         if req_type in self._drivers:

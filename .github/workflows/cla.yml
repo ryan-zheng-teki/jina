@@ -3,7 +3,7 @@ name: CLA
 on:
   issue_comment:
     types: [created]
-  pull_request:
+  pull_request_target:
     types: [opened,closed,synchronize]
 
 jobs:
@@ -18,9 +18,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: '.github/signatures/v1/cla.json'
-          path-To-cladocument: 'https://github.com/jina-ai/jina/blob/master/CLA.md'
+          path-To-cladocument: 'https://github.com/jina-ai/jina/blob/master/.github/CLA.md'
           # branch should not be protected
           branch: 'cla'
-          whitelist: hanxiao,nan-wang,jina-bot,BingHo1013,alexcg1,imsergiy,YueLiu-jina,JoanFM,lusloher
           empty-commit-flag: false
           blockchain-storage-flag: false

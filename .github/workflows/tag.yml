@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+        with:
+          submodules: true
       - uses: actions/checkout@v2
         with:
           repository: jina-ai/api
@@ -22,7 +24,7 @@ jobs:
       - run: |
           echo ::set-env name=JINA_VERSION::${GITHUB_REF/refs\/tags\/v/}
           echo ::set-env name=V_JINA_VERSION::${GITHUB_REF/refs\/tags\//}
-          pip install .
+          pip install .  --no-cache-dir
       - run: |
           cd schema
           jina export-api --yaml-path "${{env.JINA_VERSION}}.yml" latest.yml --json-path "${{env.JINA_VERSION}}.json" latest.json latest
@@ -35,6 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+        with:
+          submodules: true
       - uses: actions/setup-python@v1
         with:
           python-version: 3.7
@@ -44,8 +48,8 @@ jobs:
           echo ::set-output name=V_JINA_VERSION::${GITHUB_REF/refs\/tags\//}
       - name: install the release version
         run: |
-          pip install .
-          ./make-doc.sh release "release $JINA_VERSION of ${{github.repository}}"
+          pip install .  --no-cache-dir
+          ./scripts/make-doc.sh release "release $JINA_VERSION of ${{github.repository}}"
         env:
           JINA_VERSION: ${{steps.get_version.outputs.JINA_VERSION}}
           V_JINA_VERSION: ${{steps.get_version.outputs.V_JINA_VERSION}}

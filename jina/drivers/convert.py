@@ -7,14 +7,20 @@ import struct
 import urllib.parse
 import urllib.request
 import zlib
+from typing import Iterable
 
 import numpy as np
 
-from . import BaseDriver
-from .helper import guess_mime, array2pb, pb2array
+from . import BaseRecursiveDriver
+from .helper import guess_mime
+from ..proto.ndarray.generic import GenericNdArray
+
+if False:
+    from ..proto import jina_pb2
+    from PIL import Image
 
 
-class BaseConvertDriver(BaseDriver):
+class BaseConvertDriver(BaseRecursiveDriver):
 
     def __init__(self, target: str, override: bool = False, *args, **kwargs):
         """ Set a target attribute of the document by another attribute
@@ -28,11 +34,12 @@ class BaseConvertDriver(BaseDriver):
         self.override = override
         self.target = target
 
-    def __call__(self, *args, **kwargs):
-        for d in self.docs:
-            if getattr(d, self.target) and not self.override:
-                continue
-            self.convert(d)
+    def _apply_all(self, docs: Iterable['jina_pb2.Document'], *args, **kwargs):
+        for doc in docs:
+            if getattr(doc, self.target) and not self.override:
+                pass
+            else:
+                self.convert(doc)
 
     def convert(self, d):
         raise NotImplementedError
@@ -76,7 +83,7 @@ class MIMEDriver(BaseConvertDriver):
                         import magic
                         m_type = magic.from_buffer(d_content, mime=True)
                     except Exception as ex:
-                        self.logger.warning(f'can not sniff the MIME type due to the exception {ex}')
+                        self.logger.warning(f'can not sniff the MIME type due to the exception {repr(ex)}')
             if d.uri:
                 m_type = guess_mime(d.uri)
 
@@ -94,23 +101,25 @@ class Buffer2NdArray(BaseConvertDriver):
         super().__init__(target, *args, **kwargs)
 
     def convert(self, d):
-        d.blob.CopyFrom(array2pb(np.frombuffer(d.buffer)))
+        GenericNdArray(d.blob).value = np.frombuffer(d.buffer)
 
 
-class Blob2PngURI(BaseConvertDriver):
+class NdArray2PngURI(BaseConvertDriver):
     """Simple DocCrafter used in :command:`jina hello-world`,
-        it reads ``buffer`` into base64 png and stored in ``uri``"""
+        it reads ``NdArray`` into base64 png and stored in ``uri``"""
 
-    def __init__(self, target='uri', width: int = 28, height: int = 28, *args, **kwargs):
+    def __init__(self, target='uri', width: int = 28, height: int = 28, resize_method: str = 'BILINEAR', *args,
+                 **kwargs):
         super().__init__(target, *args, **kwargs)
         self.width = width
         self.height = height
+        self.resize_method = resize_method
 
-    def convert(self, d):
-        arr = pb2array(d.blob)
+    def png_convertor_1d(self, arr: np.array):
         pixels = []
+        arr = 255 - arr
         for p in arr[::-1]:
-            pixels.extend([255 - int(p), 255 - int(p), 255 - int(p), 255])
+            pixels.extend([p, p, p, 255])
         buf = bytearray(pixels)
 
         # reverse the vertical line order and add null bytes at the start
@@ -130,7 +139,50 @@ class Blob2PngURI(BaseConvertDriver):
             png_pack(b'IHDR', struct.pack('!2I5B', self.width, self.height, 8, 6, 0, 0, 0)),
             png_pack(b'IDAT', zlib.compress(raw_data, 9)),
             png_pack(b'IEND', b'')])
-        d.uri = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+
+        return 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+
+    @staticmethod
+    def image_to_byte_array(image: 'Image', format: str):
+        import io
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format=format)
+        img_byte_arr = img_byte_arr.getvalue()
+        return img_byte_arr
+
+    def png_convertor(self, arr: np.array):
+        arr = arr.astype(np.uint8)
+
+        if len(arr.shape) == 1:
+            return self.png_convertor_1d(arr)
+        elif len(arr.shape) == 2:
+            from PIL import Image
+            im = Image.fromarray(arr).convert('L')
+            im = im.resize((self.width, self.height), getattr(Image, self.resize_method))
+        elif len(arr.shape) == 3:
+            from PIL import Image
+            im = Image.fromarray(arr).convert('RGB')
+            im = im.resize((self.width, self.height), getattr(Image, self.resize_method))
+        else:
+            raise ValueError('arr shape length should be either 1, 2 or 3')
+
+        png_bytes = NdArray2PngURI.image_to_byte_array(im, format='PNG')
+        return 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+
+    def convert(self, arr: np.array):
+        arr.uri = self.png_convertor(arr)
+
+
+class Blob2PngURI(NdArray2PngURI):
+    """Simple DocCrafter used in :command:`jina hello-world`,
+        it reads ``buffer`` into base64 png and stored in ``uri``"""
+
+    def __init__(self, target='uri', width: int = 28, height: int = 28, *args, **kwargs):
+        super().__init__(target, width, height, *args, **kwargs)
+
+    def convert(self, d):
+        arr = GenericNdArray(d.blob).value
+        d.uri = self.png_convertor(arr)
 
 
 class URI2Buffer(BaseConvertDriver):
@@ -167,7 +219,7 @@ class URI2DataURI(URI2Buffer):
 
     def __call__(self, *args, **kwargs):
         super().__call__()
-        for d in self.docs:
+        for d in self.req.docs:
             if d.uri and not self.override:
                 continue
 

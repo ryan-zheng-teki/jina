@@ -1,11 +1,11 @@
 FROM python:3.7.6-slim
-# python3-scipy
+
 RUN apt-get update && apt-get install --no-install-recommends -y
 
 WORKDIR /jina/
 
 ADD setup.py MANIFEST.in requirements.txt extra-requirements.txt README.md ./
-
+ADD cli ./cli/
 ADD jina ./jina/
 
 ARG PIP_TAG

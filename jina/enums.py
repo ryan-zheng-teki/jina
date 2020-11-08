@@ -1,6 +1,3 @@
-__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
-__license__ = "Apache-2.0"
-
 """
 Miscellaneous enums used in jina
 
@@ -25,15 +22,18 @@ To use these enums in YAML config, following the example below:
 .. code-block:: yaml
 
       chunk_idx:
-        yaml_path: index/chunk.yml
-        replicas: $REPLICAS
+        uses: index/chunk.yml
+        parallel: $PARALLEL
         separated_workspace: true
-        replicas_type: !PollingType ANY
+        parallel_type: !PollingType ANY
         # or
-        replicas_type: ANY
+        parallel_type: ANY
         # or
-        replicas_type: any
+        parallel_type: any
 """
+
+__copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
+__license__ = "Apache-2.0"
 
 from enum import IntEnum, EnumMeta
 
@@ -47,9 +47,7 @@ class EnumType(EnumMeta):
     @staticmethod
     def register_class(cls):
         reg_cls_set = getattr(cls, '_registered_class', set())
-        if cls.__name__ not in reg_cls_set:
-            # print('reg class: %s' % cls.__name__)
-
+        if cls.__name__ not in reg_cls_set or getattr(cls, 'force_register', False):
             reg_cls_set.add(cls.__name__)
             setattr(cls, '_registered_class', reg_cls_set)
         from .helper import yaml
@@ -207,11 +205,31 @@ class PeaRoleType(BetterEnum):
     """ The enum of a Pea role
 
     """
-    REPLICA = 0
+    SINGLETON = 0
     HEAD = 1
     TAIL = 2
-    SHARD = 3
-    SINGLETON = 4
+    PARALLEL = 3
+
+
+class PodRoleType(BetterEnum):
+    """ The enum of a Pod role for visualization
+
+    """
+    POD = 0
+    JOIN = 1
+    INSPECT = 2
+    GATEWAY = 3
+    INSPECT_AUX_PASS = 4
+    JOIN_INSPECT = 5
+
+    @property
+    def is_inspect(self) -> bool:
+        """
+        if the role is inspect pod related
+
+        :return:
+        """
+        return self.value in {2, 4}
 
 
 class ClientMode(BetterEnum):
@@ -221,15 +239,54 @@ class ClientMode(BetterEnum):
     INDEX = 0
     SEARCH = 1
     TRAIN = 2
+    EVALUATE = 3
 
 
-class OnErrorSkip(BetterEnum):
+class CompressAlgo(BetterEnum):
+    """ The enum of Compress algorithms
+
+    .. note::
+        LZ4 requires additional package, to install it use pip install "jina[lz4]"
+
+    .. seealso::
+
+        https://docs.python.org/3/library/archiving.html
+    """
+    NONE = 0
+    LZ4 = 1
+    ZLIB = 2
+    GZIP = 3
+    BZ2 = 4
+    LZMA = 5
+
+
+class SkipOnErrorType(BetterEnum):
     """ The level of error handling
 
+    .. warning::
+        In theory, all methods below do not 100% guarantee the success
+        execution on the sequel flow. If something is wrong in the upstream,
+        it is hard to CARRY this exception and moving forward without ANY
+        side-effect.
     """
 
-    NONE = 0
-    EXECUTOR = 1
-    DRIVER = 2
-    HANDLE = 3
-    CALLBACK = 4
+    NONE = 0  # do not skip on error, keep running the original executor & driver logics
+    EXECUTOR = 1  # skip the executor on error, but driver is still called, no error message is labeled
+    HANDLE = 2  # skip the handle on error, no driver and executor is called, pre_hook and post_hook are called
+
+
+class FlowInspectType(BetterEnum):
+    """ Inspect strategy in the flow
+    """
+
+    HANG = 0  # keep them hanging there
+    REMOVE = 1  # remove them in the build
+    COLLECT = 2  # spawn a new pod and collect them before build
+
+    @property
+    def is_keep(self) -> bool:
+        """
+
+        :return: if this socket is using `bind` protocol
+        """
+        return self.value in {0, 2}

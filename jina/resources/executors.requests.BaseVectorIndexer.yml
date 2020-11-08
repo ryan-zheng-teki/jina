@@ -1,11 +1,12 @@
 on:
   ControlRequest:
     - !ControlReqDriver {}
-  SearchRequest:
+  [SearchRequest]:
     - !VectorSearchDriver {}
   IndexRequest:
-    - !DocPruneDriver
+    - !ExcludeQL
       with:
-        pruned: buffer
+        fields:
+          - buffer
+          - chunks
     - !VectorIndexDriver {}
-    - !ChunkPruneDriver {}

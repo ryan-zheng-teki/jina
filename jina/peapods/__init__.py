@@ -4,7 +4,9 @@ __license__ = "Apache-2.0"
 from typing import Dict, Union
 
 from .. import __default_host__
+from ..enums import PeaRoleType
 from ..logging import default_logger
+from ..helper import is_valid_local_config_source
 
 if False:
     import argparse
@@ -19,7 +21,7 @@ def Pea(args: 'argparse.Namespace' = None, allow_remote: bool = True, **kwargs):
 
     """
     if args is None:
-        from ..main.parser import set_pea_parser
+        from ..parser import set_pea_parser
         from ..helper import get_parsed_args
         _, args, _ = get_parsed_args(kwargs, set_pea_parser(), 'Pea')
     if not allow_remote:
@@ -31,9 +33,15 @@ def Pea(args: 'argparse.Namespace' = None, allow_remote: bool = True, **kwargs):
     if args.host != __default_host__:
         from .remote import RemotePea
         return RemotePea(args)
-    elif args.image:
+    elif args.uses and not is_valid_local_config_source(args.uses):
         from .container import ContainerPea
         return ContainerPea(args)
+    elif args.role == PeaRoleType.HEAD:
+        from .head_pea import HeadPea
+        return HeadPea(args)
+    elif args.role == PeaRoleType.TAIL:
+        from .tail_pea import TailPea
+        return TailPea(args)
     else:
         from .pea import BasePea
         return BasePea(args)
@@ -47,7 +55,7 @@ def Pod(args: Union['argparse.Namespace', Dict] = None, allow_remote: bool = Tru
     :param kwargs: all supported arguments from CLI
     """
     if args is None:
-        from ..main.parser import set_pod_parser
+        from ..parser import set_pod_parser
         from ..helper import get_parsed_args
         _, args, _ = get_parsed_args(kwargs, set_pod_parser(), 'Pod')
     if isinstance(args, dict):

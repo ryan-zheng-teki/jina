@@ -4,11 +4,11 @@ metas:
   workspace: $HW_WORKDIR
 requests:
   on:
-    IndexRequest:
+    [IndexRequest, SearchRequest]:
+      - !Blob2PngURI {}
       - !EncodeDriver {}
-      - !DocPruneDriver
+      - !ExcludeQL
         with:
-          pruned:
-            - meta_info
-    SearchRequest:
-      - !EncodeDriver {}
+          fields:
+            - buffer
+            - chunks

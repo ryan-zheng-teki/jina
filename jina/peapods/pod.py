@@ -4,21 +4,24 @@ __license__ = "Apache-2.0"
 import argparse
 import copy
 import time
+from argparse import Namespace
 from contextlib import ExitStack
 from queue import Empty
 from threading import Thread
-from typing import Set, Dict, List, Callable, Union
+from typing import Optional, Set, Dict, List, Callable, Union
 
 from . import Pea
 from .gateway import GatewayPea, RESTGatewayPea
-from .pea import BasePea
+from .head_pea import HeadPea
+from .tail_pea import TailPea
 from .. import __default_host__
 from ..enums import *
-from ..helper import random_port, get_random_identity, get_parsed_args, get_non_defaults_args
-from ..main.parser import set_pod_parser, set_gateway_parser
+from ..helper import random_port, get_random_identity, get_parsed_args, get_non_defaults_args, \
+    is_valid_local_config_source
+from ..parser import set_pod_parser, set_gateway_parser
 
 
-class BasePod:
+class BasePod(ExitStack):
     """A BasePod is a immutable set of peas, which run in parallel. They share the same input and output socket.
     Internally, the peas can run with the process/thread backend. They can be also run in their own containers
     """
@@ -28,29 +31,31 @@ class BasePod:
 
         :param args: arguments parsed from the CLI
         """
+        super().__init__()
         self.peas = []
         self.is_head_router = False
         self.is_tail_router = False
         self.deducted_head = None
         self.deducted_tail = None
-        if hasattr(args, 'polling') and args.polling.is_push:
-            # ONLY reset when it is push
-            args.reducing_yaml_path = '_forward'
         self._args = args
         self.peas_args = self._parse_args(args)
+
+    @property
+    def is_singleton(self) -> bool:
+        """Return if the Pod contains only a single Pea """
+        return not (self.is_head_router or self.is_tail_router)
 
     @property
     def is_idle(self) -> bool:
         """A Pod is idle when all its peas are idle, see also :attr:`jina.peapods.pea.Pea.is_idle`.
         """
-        return all(p.is_idle for p in self.peas if p.is_ready.is_set())
+        return all(p.is_idle for p in self.peas if p.is_ready_event.is_set())
 
     def close_if_idle(self):
         """Check every second if the pod is in idle, if yes, then close the pod"""
         while True:
             if self.is_idle:
                 self.close()
-                break  # only run once
             time.sleep(1)
 
     @property
@@ -68,23 +73,36 @@ class BasePod:
         """Get the grpc host name """
         return self.peas_args['peas'][0].host
 
-    def _parse_args(self, args):
+    def _parse_args(self, args: Namespace) -> Dict[str, Optional[Union[List[Namespace], Namespace]]]:
         peas_args = {
             'head': None,
             'tail': None,
             'peas': []
         }
-
-        if getattr(args, 'replicas', 1) > 1:
+        if getattr(args, 'parallel', 1) > 1:
             # reasons to separate head and tail from peas is that they
             # can be deducted based on the previous and next pods
+            _set_after_to_pass(args)
+            self.is_head_router = True
+            self.is_tail_router = True
             peas_args['head'] = _copy_to_head_args(args, args.polling.is_push)
             peas_args['tail'] = _copy_to_tail_args(args)
             peas_args['peas'] = _set_peas_args(args, peas_args['head'], peas_args['tail'])
-            self.is_head_router = True
-            self.is_tail_router = True
+        elif getattr(args, 'uses_before', None) or getattr(args, 'uses_after', None):
+            args.scheduling = SchedulerType.ROUND_ROBIN
+            if getattr(args, 'uses_before', None):
+                self.is_head_router = True
+                peas_args['head'] = _copy_to_head_args(args, args.polling.is_push)
+            if getattr(args, 'uses_after', None):
+                self.is_tail_router = True
+                peas_args['tail'] = _copy_to_tail_args(args)
+            peas_args['peas'] = _set_peas_args(args, peas_args.get('head', None), peas_args.get('tail', None))
         else:
+            _set_after_to_pass(args)
+            self.is_head_router = False
+            self.is_tail_router = False
             peas_args['peas'] = [args]
+
 
         # note that peas_args['peas'][0] exist either way and carries the original property
         return peas_args
@@ -138,7 +156,7 @@ class BasePod:
             raise ValueError('ambiguous tail node, maybe it is deducted already?')
 
     @property
-    def all_args(self):
+    def all_args(self) -> List[Namespace]:
         """Get all arguments of all Peas in this BasePod. """
         return self.peas_args['peas'] + (
             [self.peas_args['head']] if self.peas_args['head'] else []) + (
@@ -163,7 +181,7 @@ class BasePod:
             # s.host_in = __default_host__
             # s.host_out = __default_host__
 
-    def start_sentinels(self):
+    def start_sentinels(self) -> None:
         self.sentinel_threads = []
         if isinstance(self._args, argparse.Namespace) and getattr(self._args, 'shutdown_idle', False):
             self.sentinel_threads.append(Thread(target=self.close_if_idle,
@@ -172,7 +190,7 @@ class BasePod:
         for t in self.sentinel_threads:
             t.start()
 
-    def start(self):
+    def start(self) -> 'FlowPod':
         """Start to run all Peas in this BasePod.
 
         Remember to close the BasePod with :meth:`close`.
@@ -180,31 +198,30 @@ class BasePod:
         Note that this method has a timeout of ``timeout_ready`` set in CLI,
         which is inherited from :class:`jina.peapods.peas.BasePea`
         """
-        self.stack = ExitStack()
         # start head and tail
         if self.peas_args['head']:
-            p = BasePea(self.peas_args['head'])
+            p = HeadPea(self.peas_args['head'])
             self.peas.append(p)
-            self.stack.enter_context(p)
+            self.enter_context(p)
 
         if self.peas_args['tail']:
-            p = BasePea(self.peas_args['tail'])
+            p = TailPea(self.peas_args['tail'])
             self.peas.append(p)
-            self.stack.enter_context(p)
+            self.enter_context(p)
 
         # start real peas and accumulate the storage id
         if len(self.peas_args['peas']) > 1:
             start_rep_id = 1
-            role = PeaRoleType.REPLICA
+            role = PeaRoleType.PARALLEL
         else:
             start_rep_id = 0
             role = PeaRoleType.SINGLETON
         for idx, _args in enumerate(self.peas_args['peas'], start=start_rep_id):
-            _args.replica_id = idx
+            _args.pea_id = idx
             _args.role = role
             p = Pea(_args, allow_remote=False)
             self.peas.append(p)
-            self.stack.enter_context(p)
+            self.enter_context(p)
 
         self.start_sentinels()
         return self
@@ -231,9 +248,9 @@ class BasePod:
 
     @property
     def is_shutdown(self) -> bool:
-        return all(not p.is_ready.is_set() for p in self.peas)
+        return all(not p.is_ready_event.is_set() for p in self.peas)
 
-    def __enter__(self):
+    def __enter__(self) -> Union['GatewayFlowPod', 'FlowPod']:
         return self.start()
 
     @property
@@ -244,14 +261,14 @@ class BasePod:
     def is_ready(self) -> bool:
         """Wait till the ready signal of this BasePod.
 
-        The pod is ready only when all the contained Peas returns is_ready
+        The pod is ready only when all the contained Peas returns is_ready_event
         """
         for p in self.peas:
-            p.is_ready.wait()
+            p.is_ready_event.wait()
         return True
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        super().__exit__(exc_type, exc_val, exc_tb)
 
     def join(self):
         """Wait until all peas exit"""
@@ -263,9 +280,6 @@ class BasePod:
         finally:
             self.peas.clear()
 
-    def close(self):
-        self.stack.close()
-
 
 class MutablePod(BasePod):
     """A :class:`MutablePod` is a pod where all peas and their connections are given"""
@@ -276,11 +290,16 @@ class MutablePod(BasePod):
 
 class FlowPod(BasePod):
     """A :class:`FlowPod` is like a :class:`BasePod`, but it exposes more interfaces for tweaking its connections with
-    other Pods, which comes in handy when used in the Flow API
+    other Pods, which comes in handy when used in the Flow API.
+
+    .. note::
+
+        Unlike :class:`BasePod`, this class takes a :class:`dict` as the first argument.
+
     """
 
     def __init__(self, kwargs: Dict,
-                 needs: Set[str] = None, parser: Callable = set_pod_parser):
+                 needs: Set[str] = None, parser: Callable = set_pod_parser, pod_role: 'PodRoleType' = PodRoleType.POD):
         """
 
         :param kwargs: unparsed argument in dict, if given the
@@ -291,6 +310,7 @@ class FlowPod(BasePod):
         super().__init__(self._args)
         self.needs = needs if needs else set()  #: used in the :class:`jina.flow.Flow` to build the graph
         self._kwargs = get_non_defaults_args(self._args, _parser)
+        self.role = pod_role
 
     def to_cli_command(self):
         if isinstance(self, GatewayPod):
@@ -301,34 +321,29 @@ class FlowPod(BasePod):
         return f'{cmd} {" ".join(self.cli_args)}'
 
     @staticmethod
-    def connect(first: 'BasePod', second: 'BasePod', first_socket_type: 'SocketType'):
+    def connect(first: 'FlowPod', second: 'FlowPod', first_socket_type: 'SocketType') -> None:
         """Connect two Pods
 
         :param first: the first BasePod
         :param second: the second BasePod
         :param first_socket_type: socket type of the first BasePod, availables are PUSH_BIND, PUSH_CONNECT, PUB_BIND
         """
-        if first_socket_type == SocketType.PUSH_BIND:
-            first.tail_args.socket_out = SocketType.PUSH_BIND
-            second.head_args.socket_in = SocketType.PULL_CONNECT
+        first.tail_args.socket_out = first_socket_type
+        second.head_args.socket_in = first.tail_args.socket_out.paired
 
+        if first_socket_type == SocketType.PUSH_BIND:
             first.tail_args.host_out = __default_host__
             second.head_args.host_in = _fill_in_host(bind_args=first.tail_args,
                                                      connect_args=second.head_args)
             second.head_args.port_in = first.tail_args.port_out
         elif first_socket_type == SocketType.PUSH_CONNECT:
-            first.tail_args.socket_out = SocketType.PUSH_CONNECT
-            second.head_args.socket_in = SocketType.PULL_BIND
-
             first.tail_args.host_out = _fill_in_host(connect_args=first.tail_args,
                                                      bind_args=second.head_args)
             second.head_args.host_in = __default_host__
             first.tail_args.port_out = second.head_args.port_in
         elif first_socket_type == SocketType.PUB_BIND:
-            first.tail_args.socket_out = SocketType.PUB_BIND
-            first.tail_args.num_part += 1
-            second.head_args.socket_in = SocketType.SUB_CONNECT
-
+            if not second.role.is_inspect:
+                first.tail_args.num_part += 1
             first.tail_args.host_out = __default_host__  # bind always get default 0.0.0.0
             second.head_args.host_in = _fill_in_host(bind_args=first.tail_args,
                                                      connect_args=second.head_args)  # the hostname of s_pod
@@ -338,7 +353,7 @@ class FlowPod(BasePod):
 
     def connect_to_tail_of(self, pod: 'BasePod'):
         """Eliminate the head node by connecting prev_args node directly to peas """
-        if self._args.replicas > 1 and self.is_head_router:
+        if self._args.parallel > 1 and self.is_head_router:
             # keep the port_in and socket_in of prev_args
             # only reset its output
             pod.tail_args = _copy_to_head_args(pod.tail_args, self._args.polling.is_push, as_router=False)
@@ -350,43 +365,44 @@ class FlowPod(BasePod):
             self.is_head_router = False
             self.deducted_head = pod.tail_args
         else:
-            raise ValueError('the current pod has no head router, deduct the head is confusing')
+            raise ValueError('the current pod has no head router, deducting the head is confusing')
 
     def connect_to_head_of(self, pod: 'BasePod'):
         """Eliminate the tail node by connecting next_args node directly to peas """
-        if self._args.replicas > 1 and self.is_tail_router:
+        if self._args.parallel > 1 and self.is_tail_router:
             # keep the port_out and socket_out of next_arts
             # only reset its input
             pod.head_args = _copy_to_tail_args(pod.head_args,
                                                as_router=False)
             # update peas to receive from it
             self.peas_args['peas'] = _set_peas_args(self._args, self.head_args, pod.head_args)
-            # remove the head node
+            # remove the tail node
             self.peas_args['tail'] = None
-            # head is no longer a router anymore
+            # tail is no longer a router anymore
             self.is_tail_router = False
             self.deducted_tail = pod.head_args
         else:
-            raise ValueError('the current pod has no tail router, deduct the tail is confusing')
+            raise ValueError('the current pod has no tail router, deducting the tail is confusing')
 
-    def start(self):
+    def start(self) -> 'FlowPod':
         if self._args.host == __default_host__:
             return super().start()
         else:
             from .remote import RemoteMutablePod
             _remote_pod = RemoteMutablePod(self.peas_args)
-            self.stack = ExitStack()
-            self.stack.enter_context(_remote_pod)
+            self.enter_context(_remote_pod)
             self.start_sentinels()
             return self
 
 
-def _set_peas_args(args, head_args, tail_args):
+def _set_peas_args(args: Namespace, head_args: Namespace = None, tail_args: Namespace = None) -> List[Namespace]:
     result = []
-    for _ in range(args.replicas):
+    for _ in range(args.parallel):
         _args = copy.deepcopy(args)
-        _args.port_in = head_args.port_out
-        _args.port_out = tail_args.port_in
+        if head_args:
+            _args.port_in = head_args.port_out
+        if tail_args:
+            _args.port_out = tail_args.port_in
         _args.port_ctrl = random_port()
         _args.identity = get_random_identity()
         _args.socket_out = SocketType.PUSH_CONNECT
@@ -399,68 +415,76 @@ def _set_peas_args(args, head_args, tail_args):
                 raise NotImplementedError
         else:
             _args.socket_in = SocketType.SUB_CONNECT
-        _args.host_in = _fill_in_host(bind_args=head_args, connect_args=_args)
-        _args.host_out = _fill_in_host(bind_args=tail_args, connect_args=_args)
+        if head_args:
+            _args.host_in = _fill_in_host(bind_args=head_args, connect_args=_args)
+        if tail_args:
+            _args.host_out = _fill_in_host(bind_args=tail_args, connect_args=_args)
         result.append(_args)
     return result
 
 
-def _copy_to_head_args(args, is_push: bool, as_router: bool = True):
+def _set_after_to_pass(args):
+    # TODO: I don't remember what is this for? once figure out, this function should be removed
+    # remark 1: i think it's related to route driver.
+    if hasattr(args, 'polling') and args.polling.is_push:
+        # ONLY reset when it is push
+        args.uses_after = '_pass'
+
+
+def _copy_to_head_args(args: Namespace, is_push: bool, as_router: bool = True) -> Namespace:
     """Set the outgoing args of the head router
     """
 
     _head_args = copy.deepcopy(args)
     _head_args.port_ctrl = random_port()
     _head_args.port_out = random_port()
+    _head_args.uses = None
     if is_push:
         if args.scheduling == SchedulerType.ROUND_ROBIN:
             _head_args.socket_out = SocketType.PUSH_BIND
             if as_router:
-                _head_args.yaml_path = '_forward'
+                _head_args.uses = args.uses_before or '_pass'
         elif args.scheduling == SchedulerType.LOAD_BALANCE:
             _head_args.socket_out = SocketType.ROUTER_BIND
             if as_router:
-                _head_args.yaml_path = '_route'
+                _head_args.uses = args.uses_before or '_route'
     else:
         _head_args.socket_out = SocketType.PUB_BIND
-        _head_args.num_part = args.replicas
+        _head_args.num_part = args.parallel
         if as_router:
-            _head_args.yaml_path = '_forward'
+            _head_args.uses = args.uses_before or '_pass'
 
     if as_router:
         _head_args.name = args.name or ''
         _head_args.role = PeaRoleType.HEAD
 
-    # head and tail never run in docker, reset their image to None
-    _head_args.image = None
     return _head_args
 
 
-def _copy_to_tail_args(args, as_router: bool = True):
+def _copy_to_tail_args(args: Namespace, as_router: bool = True) -> Namespace:
     """Set the incoming args of the tail router
     """
     _tail_args = copy.deepcopy(args)
     _tail_args.port_in = random_port()
     _tail_args.port_ctrl = random_port()
     _tail_args.socket_in = SocketType.PULL_BIND
+    _tail_args.uses = None
+
     if as_router:
-        _tail_args.yaml_path = args.reducing_yaml_path
+        _tail_args.uses = args.uses_after or '_merge'
         _tail_args.name = args.name or ''
         _tail_args.role = PeaRoleType.TAIL
 
-    # head and tail never run in docker, reset their image to None
-    _tail_args.image = None
     return _tail_args
 
 
-def _fill_in_host(bind_args, connect_args):
+def _fill_in_host(bind_args: Namespace, connect_args: Namespace) -> str:
     from sys import platform
 
     bind_local = (bind_args.host == '0.0.0.0')
-    bind_docker = (bind_args.image is not None and bind_args.image)
-    conn_tail = (connect_args.name is not None and connect_args.role == PeaRoleType.TAIL)
     conn_local = (connect_args.host == '0.0.0.0')
-    conn_docker = (connect_args.image is not None and connect_args.image)
+    conn_docker = (
+            getattr(connect_args, 'uses', None) is not None and not is_valid_local_config_source(connect_args.uses))
     bind_conn_same_remote = not bind_local and not conn_local and (bind_args.host == connect_args.host)
     if platform == "linux" or platform == "linux2":
         local_host = '0.0.0.0'
@@ -483,12 +507,11 @@ def _fill_in_host(bind_args, connect_args):
 class GatewayPod(BasePod):
     """A :class:`BasePod` that holds a Gateway """
 
-    def start(self):
-        self.stack = ExitStack()
+    def start(self) -> 'GatewayPod':
         for s in self.all_args:
             p = RESTGatewayPea(s) if getattr(s, 'rest_api', False) else GatewayPea(s)
             self.peas.append(p)
-            self.stack.enter_context(p)
+            self.enter_context(p)
 
         self.start_sentinels()
         return self
@@ -499,3 +522,4 @@ class GatewayFlowPod(GatewayPod, FlowPod):
 
     def __init__(self, kwargs: Dict = None, needs: Set[str] = None):
         FlowPod.__init__(self, kwargs, needs, parser=set_gateway_parser)
+        self.role = PodRoleType.GATEWAY

@@ -1,8 +1,14 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
+from typing import Iterable
+
 from . import BaseExecutableDriver
-from .helper import extract_chunks, array2pb
+from .helper import extract_docs
+from ..proto.ndarray.generic import GenericNdArray
+
+if False:
+    from ..proto import jina_pb2
 
 
 class BaseEncodeDriver(BaseExecutableDriver):
@@ -16,32 +22,18 @@ class EncodeDriver(BaseEncodeDriver):
     """Extract the chunk-level content from documents and call executor and do encoding
     """
 
-    def __call__(self, *args, **kwargs):
-        contents, chunk_pts, no_chunk_docs, bad_chunk_ids = extract_chunks(self.docs, self.chunks,
-                                                                           self.req.filter_by,
-                                                                           embedding=False)
+    def _apply_all(self, docs: Iterable['jina_pb2.Document'], *args, **kwargs) -> None:
+        contents, docs_pts, bad_doc_ids = extract_docs(docs, embedding=False)
 
-        if no_chunk_docs:
-            self.logger.warning(f'these docs contain no chunk: {no_chunk_docs}')
+        if bad_doc_ids:
+            self.logger.warning(f'these bad docs can not be added: {bad_doc_ids} '
+                                f'from level depth {docs[0].granularity}')
 
-        if bad_chunk_ids:
-            self.logger.warning(f'these bad chunks can not be added: {bad_chunk_ids}')
-
-        if chunk_pts:
+        if docs_pts:
             embeds = self.exec_fn(contents)
-            if len(chunk_pts) != embeds.shape[0]:
+            if len(docs_pts) != embeds.shape[0]:
                 self.logger.error(
-                    'mismatched %d chunks and a %s shape embedding, '
-                    'the first dimension must be the same' % (len(chunk_pts), embeds.shape))
-            for c, emb in zip(chunk_pts, embeds):
-                c.embedding.CopyFrom(array2pb(emb))
-
-
-class UnaryEncodeDriver(EncodeDriver):
-    """The :class:`UnaryEncodeDriver` extracts the chunk-level content from documents and copies
-        the same content to the embedding
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._method_name = None
-        self._exec_fn = lambda x: x
+                    f'mismatched {len(docs_pts)} docs from level {docs[0].granularity} '
+                    f'and a {embeds.shape} shape embedding, the first dimension must be the same')
+            for doc, embedding in zip(docs_pts, embeds):
+                GenericNdArray(doc.embedding).value = embedding

@@ -184,21 +184,7 @@
         {% endblock %}
       </nav>
 
-      <div class="card table-of-contents">
-          <span class="card-title">Table of Contents</span>
-            <div class="card-content">
-            {{ toc }}
-            </div>
-        <a href="https://github.com/jina-ai/jina/">
-          <span class="toc-card-footer">
-            <span>Visit us on Github</span>
-          </span>
-        </a>
-      </div>
-
-      <div id="showhide-navbar-btn" onclick="showhide_navbar()">
-      </div>
-
+   
       <div class="wy-nav-content">
       {%- block content %}
         {% if theme_style_external_links|tobool %}
@@ -247,7 +233,29 @@
         y.style.marginLeft = "0";
         z.style.left = "0px";
       }
+
     }
+    function showhide_littlenavbar() {
+      var x = document.getElementById("little-navbar");
+      if (x.style.display === "none") {
+        x.style.display = "block";
+      } else {
+        x.style.display = "none";
+      }
+    }
+  </script>
+
+  <!-- Search box becomes active when you press the slash(/) key anywhere on the page-->
+  <script>
+    const body = document.querySelector('body');
+    const searchBox = document.querySelector('form').querySelector('input[type="text"]');
+
+    body.addEventListener('keyup', event => {
+      event.preventDefault()
+      if (event.key === '/') {
+        searchBox.focus();
+      }
+    });
   </script>
 
   {# Do not conflict with RTD insertion of analytics script #}

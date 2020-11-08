@@ -4,7 +4,7 @@
 
 Instead of 
 ```bash
-jina pod --yaml-path hub/example/mwu_encoder.yml --port-in 55555 --port-out 55556
+jina pod --uses hub/example/mwu_encoder.yml --port-in 55555 --port-out 55556
 ```
 
 After this tutorial, you can use the Pod image via:
@@ -18,7 +18,7 @@ from jina.flow import Flow
 
 f = (Flow()
         .add(name='my-encoder', image='jinaai/hub.examples.mwu_encoder', port_in=55555, port_out=55556)
-        .add(name='my-indexer', yaml_path='indexer.yml'))
+        .add(name='my-indexer', uses='indexer.yml'))
 ```
 
 ... or use the Pod image via Jina CLI
@@ -26,7 +26,7 @@ f = (Flow()
 jina pod --image jinaai/hub.examples.mwu_encoder --port-in 55555 --port-out 55556
 ```
 
-More information about [the usage can be found here](#use-your-pod-image).
+More information about [the usage can be found here](./use-your-pod.html#use-your-pod-image).
 
 
 ## Why?
@@ -42,7 +42,7 @@ Here are a list of reasons that may motivate you to build a Pod image:
 - Your awesome executor requires certain Linux headers that can only be installed via `apt` or `yum`, but you don't have `sudo` on the host.
 - You executor relies on a pretrained model, you want to include this 100MB file into the image so that people don't need to download it again.  
 - You use Kubernetes or Docker Swarm and this orchestration framework requires each microservice to run as a Docker container.
-- You are using Jina on the cloud and you want to deploy a immutable Pod and version control it.
+- You are using Jina on the cloud and you want to deploy an immutable Pod and version control it.
 - You have figured out a set of parameters that works best for an executor, you want to write it down in a YAML config and share it to others.
 - You are debugging, doing try-and-error on exploring new packages, and you don't want ruin your local dev environments. 
 
@@ -59,7 +59,7 @@ Typically, the following files are packed into the container image:
 | `*.yml`          | a YAML file describes the executor arguments and configs, if you want users to use your config;     |
 | Other data files | may be required to run the executor, e.g. pre-trained model, fine-tuned model, home-made data.      |
 
-Except `Dockerfile`, all others are optional to build a valid Pod image depending on your case. `build.args` is only required when you want to [upload your image to Jina Hub](#publish-your-pod-image-to-jina-hub).
+Except `Dockerfile`, all others are optional to build a valid Pod image depending on your case. `build.args` is only required when you want to [upload your image to Jina Hub](./publish-your-pod-image.html#publish-your-pod-image-to-jina-hub).
     
 ## Step-by-Step Example
 
@@ -79,7 +79,7 @@ metas:
   workspace: ./
 ```
 
-The documentations of the YAML syntax [can be found at here](http://0.0.0.0:8000/chapters/yaml/yaml.html#executor-yaml-syntax). 
+The documentations of the YAML syntax [can be found at here](../yaml/yaml.html#executor-yaml-syntax). 
 
 ### 2. Write a 3-Line `Dockerfile`
 
@@ -90,7 +90,7 @@ FROM jinaai/jina:devel
 
 ADD *.py mwu_encoder.yml ./
 
-ENTRYPOINT ["jina", "pod", "--yaml-path", "mwu_encoder.yml"]
+ENTRYPOINT ["jina", "pod", "--uses", "mwu_encoder.yml"]
 ```
 
 Let's now look at these three lines one by one.
@@ -125,7 +125,7 @@ In this example, our dummy `MWUEncoder` does not require extra data files.
 
 > 
 ```Dockerfile
-ENTRYPOINT ["jina", "pod", "--yaml-path", "mwu_encoder.yml"]
+ENTRYPOINT ["jina", "pod", "--uses", "mwu_encoder.yml"]
 ``` 
 
 The last step is to specify the entrypoint of this image, usually via `jina pod`.
@@ -138,7 +138,7 @@ docker run jinaai/hub.examples.mwu_encoder
  
 It is equal to:
 ```bash
-jina pod --yaml-path hub/example/mwu_encoder.yml
+jina pod --uses hub/example/mwu_encoder.yml
 ```
 
 Any followed key-value arguments after `docker run jinaai/hub.examples.mwu_encoder` will be passed to `jina pod`. For example,
@@ -149,13 +149,13 @@ docker run jinaai/hub.examples.mwu_encoder --port-in 55555 --port-out 55556
  
 It is equal to:
 ```bash
-jina pod --yaml-path hub/example/mwu_encoder.yml --port-in 55555 --port-out 55556
+jina pod --uses hub/example/mwu_encoder.yml --port-in 55555 --port-out 55556
 ```
 
 One can also override the internal YAML config by giving an out-of-docker external YAML config via:
 
 ```bash
-docker run $(pwd)/hub/example/mwu_encoder_ext.yml:/ext.yml jinaai/hub.examples.mwu_encoder --yaml-path /ext.yml
+docker run -v $(pwd)/hub/example/mwu_encoder_ext.yml:/ext.yml jinaai/hub.examples.mwu_encoder --uses /ext.yml
 ```
 
 

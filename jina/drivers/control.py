@@ -4,8 +4,32 @@ __license__ = "Apache-2.0"
 import time
 
 from . import BaseDriver
+from .querylang.queryset.dunderkey import dunder_get
 from ..excepts import UnknownControlCommand, RequestLoopEnd, NoExplicitMessage
-from ..proto import jina_pb2, is_data_request
+from ..proto import jina_pb2
+
+
+class LogInfoDriver(BaseDriver):
+    """Log output the request info"""
+
+    def __init__(self, key: str = 'request', *args, **kwargs):
+        """
+        :param key: (str) that represents a first level or nested key in the dict
+        :param args:
+        :param kwargs:
+        """
+        super().__init__(*args, **kwargs)
+        self.key = key
+
+    def __call__(self, *args, **kwargs):
+        self.logger.info(dunder_get(self.msg.as_pb_object, self.key))
+
+
+class WaitDriver(BaseDriver):
+    """Wait for some seconds"""
+
+    def __call__(self, *args, **kwargs):
+        time.sleep(5)
 
 
 class ControlReqDriver(BaseDriver):
@@ -23,49 +47,6 @@ class ControlReqDriver(BaseDriver):
             raise UnknownControlCommand('don\'t know how to handle %s' % self.req)
 
 
-class LogInfoDriver(BaseDriver):
-    """Log output the request info"""
-
-    def __init__(self, field: str = 'msg', *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.field = field
-
-    def __call__(self, *args, **kwargs):
-        self.logger.info(getattr(self, self.field, 'msg'))
-
-
-class WaitDriver(BaseDriver):
-    """Wait for some seconds"""
-
-    def __call__(self, *args, **kwargs):
-        time.sleep(5)
-
-
-class ForwardDriver(BaseDriver):
-    """Forward the message to next pod"""
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
-class PublishDriver(ControlReqDriver):
-    """Publish the message to multiple pods
-
-    .. note::
-        used with PUB_BIND port
-    """
-
-    def __init__(self, num_part: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.num_part = num_part
-
-    def __call__(self, *args, **kwargs):
-        if is_data_request(self.req):
-            self.envelope.num_part.append(self.num_part)
-        else:
-            super().__call__(*args, **kwargs)
-
-
 class RouteDriver(ControlReqDriver):
     """A simple load balancer forward message to the next available pea
 
@@ -80,13 +61,19 @@ class RouteDriver(ControlReqDriver):
 
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, raise_no_dealer: bool = False, *args, **kwargs):
+        """
+        :param raise_no_dealer: raise a RuntimeError when no available dealer
+        :param args:
+        :param kwargs:
+        """
         super().__init__(*args, **kwargs)
         self.idle_dealer_ids = set()
         self.is_pollin_paused = False
+        self.raise_no_dealer = raise_no_dealer
 
     def __call__(self, *args, **kwargs):
-        if is_data_request(self.req):
+        if self.msg.is_data_request:
             self.logger.debug(self.idle_dealer_ids)
             if self.idle_dealer_ids:
                 dealer_id = self.idle_dealer_ids.pop()
@@ -94,11 +81,21 @@ class RouteDriver(ControlReqDriver):
                 if not self.idle_dealer_ids:
                     self.pea.zmqlet.pause_pollin()
                     self.is_pollin_paused = True
-            else:
+            elif self.raise_no_dealer:
                 raise RuntimeError('if this router connects more than one dealer, '
                                    'then this error should never be raised. often when it '
                                    'is raised, some Pods must fail to start, so please go '
                                    'up and check the first error message in the log')
+            # else:
+            #    this FALLBACK to trivial message pass
+            #
+            # Explanation on the logic here:
+            # there are two cases that when `idle_dealer_ids` is empty
+            # (1) this driver is used in a PUSH-PULL fan-out setting,
+            # where no dealer is registered in the first place, so `idle_dealer_ids` is empty
+            # all the time
+            # (2) this driver is used in a ROUTER-DEALER fan-out setting,
+            # where some dealer is broken/fails to start, so `idle_dealer_ids` is empty
         elif self.req.command == jina_pb2.Request.ControlRequest.IDLE:
             self.idle_dealer_ids.add(self.envelope.receiver_id)
             self.logger.debug(f'{self.envelope.receiver_id} is idle')
@@ -108,3 +105,7 @@ class RouteDriver(ControlReqDriver):
             raise NoExplicitMessage
         else:
             super().__call__(*args, **kwargs)
+
+
+class ForwardDriver(RouteDriver):
+    """Alias to :class:`RouteDriver`"""

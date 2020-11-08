@@ -1,163 +1,91 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Callable, Dict
+from argparse import Namespace
+from typing import Dict, Union, Type, Optional, Any
 
-import grpc
-
+from .jinad import PeaAPI, PodAPI, JinadAPI
 from .pea import BasePea
-from .zmq import Zmqlet, send_ctrl_message
-from ..clients.python import GrpcClient
-from ..helper import kwargs2list
-from ..logging import get_logger
-from ..proto import jina_pb2
-
-if False:
-    import argparse
+from ..helper import colored, cached_property
 
 
-class PeaSpawnHelper(GrpcClient):
-    body_tag = 'pea'
-
-    def __init__(self, args: 'argparse.Namespace'):
-        super().__init__(args)
-        self.ctrl_addr, self.ctrl_with_ipc = Zmqlet.get_ctrl_address(args)
-        self.args = args
-        self.timeout_shutdown = 10
-        self.callback_on_first = True
-        self.args.log_remote = False
-        self._remote_logger = get_logger('🌏', **vars(self.args), fmt_str='🌏 %(message)s')
-
-    def call(self, set_ready: Callable = None):
-        """
-
-        :param set_ready: :func:`set_ready` signal from :meth:`jina.peapods.peas.BasePea.set_ready`
-        :return:
-        """
-        req = jina_pb2.SpawnRequest()
-        self.args.log_remote = True
-        getattr(req, self.body_tag).args.extend(kwargs2list(vars(self.args)))
-        self.remote_logging(req, set_ready)
-
-    def remote_logging(self, req, set_ready):
-        try:
-            for resp in self._stub.Spawn(req):
-                if set_ready and self.callback_on_first:
-                    set_ready(resp)
-                    self.callback_on_first = False
-                self._remote_logger.info(resp.log_record)
-        except grpc.RpcError:
-            pass
-
-    def close(self):
-        if not self.is_closed:
-            if self.ctrl_addr:
-                send_ctrl_message(self.ctrl_addr, jina_pb2.Request.ControlRequest.TERMINATE,
-                                  timeout=self.timeout_shutdown)
-            super().close()
-            self.is_closed = True
-
-
-class PodSpawnHelper(PeaSpawnHelper):
-    body_tag = 'pod'
-
-    def __init__(self, args: 'argparse.Namespace'):
-        super().__init__(args)
-        self.all_ctrl_addr = []  #: all peas control address and ports of this pod, need to be set in set_ready()
-
-    def close(self):
-        if not self.is_closed:
-            for ctrl_addr in self.all_ctrl_addr:
-                send_ctrl_message(ctrl_addr, jina_pb2.Request.ControlRequest.TERMINATE,
-                                  timeout=self.timeout_shutdown)
-            GrpcClient.close(self)
-            self.is_closed = True
-
-
-class MutablePodSpawnHelper(PodSpawnHelper):
-
-    def __init__(self, peas_args: Dict):
-        inited = False
-        for k in peas_args.values():
-            if k:
-                if not isinstance(k, list):
-                    k = [k]
-                if not inited:
-                    # any pea will do, we just need its host and port_expose
-                    super().__init__(k[0])
-                    inited = True
-                for kk in k:
-                    kk.log_remote = True
-                    self.all_ctrl_addr.append(Zmqlet.get_ctrl_address(kk)[0])
-        self.args = peas_args
-
-    def call(self, set_ready: Callable = None):
-
-        self.remote_logging(peas_args2mutable_pod_req(self.args), set_ready)
-
-
-def peas_args2mutable_pod_req(peas_args: Dict):
-    def pod2pea_args_list(args):
-        return kwargs2list(vars(args))
-
-    req = jina_pb2.SpawnRequest()
-    if peas_args['head']:
-        req.mutable_pod.head.args.extend(pod2pea_args_list(peas_args['head']))
-    if peas_args['tail']:
-        req.mutable_pod.tail.args.extend(pod2pea_args_list(peas_args['tail']))
-    if peas_args['peas']:
-        for q in peas_args['peas']:
-            _a = req.mutable_pod.peas.add()
-            _a.args.extend(pod2pea_args_list(q))
-    return req
-
-
-def mutable_pod_req2peas_args(req):
-    from ..main.parser import set_pea_parser
-    return {
-        'head': set_pea_parser().parse_known_args(req.head.args)[0] if req.head.args else None,
-        'tail': set_pea_parser().parse_known_args(req.tail.args)[0] if req.tail.args else None,
-        'peas': [set_pea_parser().parse_known_args(q.args)[0] for q in req.peas] if req.peas else []
-    }
+def namespace_to_dict(args: Union[Dict[str, 'Namespace'], 'Namespace']) -> Dict[str, Any]:
+    """ helper function to convert argparse.Namespace to json to be uploaded via REST """
+    if isinstance(args, Namespace):
+        return vars(args)
+    elif isinstance(args, dict):
+        pea_args = {}
+        for k, v in args.items():
+            if isinstance(v, Namespace):
+                pea_args[k] = vars(v)
+            elif isinstance(v, list):
+                pea_args[k] = [vars(_) for _ in v]
+            else:
+                pea_args[k] = v
+        return pea_args
 
 
 class RemotePea(BasePea):
-    """A RemotePea that spawns a remote :class:`BasePea`
+    """REST based Pea for remote Pea management
 
-    Useful in Jina CLI
+    # TODO: This shouldn't inherit BasePea, Needs to change to a runtime
     """
-    remote_helper = PeaSpawnHelper
+
+    APIClass = PeaAPI  # type: Type['JinadAPI']
+
+    @cached_property
+    def remote_id(self) -> str:
+        return self.spawn_remote(host=self.args.host, port=self.args.port_expose)
+
+    def spawn_remote(self, host: str, port: int, **kwargs) -> Optional[str]:
+        self.api = self.APIClass(host, port, self.logger, **kwargs)
+
+        if self.api.is_alive:
+            pea_args = namespace_to_dict(self.args)
+            if self.api.upload(pea_args, **kwargs):
+                return self.api.create(pea_args, **kwargs)
 
     def loop_body(self):
-        self._remote = self.remote_helper(self.args)
-        self._remote.start(self.set_ready)  # auto-close after
+        if self.remote_id:
+            self.logger.success(f'created remote {self.api.kind} with id {colored(self.remote_id, "cyan")}')
+            self.set_ready()
+            self.api.log(self.remote_id)
+        else:
+            self.logger.error(f'fail to create {self.__class__.__name__} remotely')
+            self.is_shutdown.set()
+
+    def delete_remote(self):
+        if hasattr(self, 'api') and self.api.is_alive and self.remote_id:
+            self.api.delete(self.remote_id)
+
+    def loop_teardown(self):
+        self.delete_remote()
 
     def close(self):
-        self._remote.close()
+        # close is `pass` here to avoid sending a terminate signal to the remote via zmq
+        pass
 
 
 class RemotePod(RemotePea):
-    """A RemotePod that spawns a remote :class:`BasePod`
-
-    Useful in Jina CLI
+    """REST based pod to be used while invoking remote Pod
     """
-    remote_helper = PodSpawnHelper
 
-    def set_ready(self, resp):
-        _rep = getattr(resp, resp.WhichOneof('body'))
-        peas_args = mutable_pod_req2peas_args(_rep)
-        all_args = peas_args['peas'] + (
-            [peas_args['head']] if peas_args['head'] else []) + (
-                       [peas_args['tail']] if peas_args['tail'] else [])
-        for s in all_args:
-            s.host = self.args.host
-            self._remote.all_ctrl_addr.append(Zmqlet.get_ctrl_address(s)[0])
-        super().set_ready()
+    APIClass = PodAPI  # type: Type['JinadAPI']
+
+    def spawn_remote(self, host: str, port: int, pod_type: str = 'cli', **kwargs) -> Optional[str]:
+        return super().spawn_remote(host, port, pod_type=pod_type)
 
 
-class RemoteMutablePod(RemotePea):
-    """A RemoteMutablePod that spawns a remote :class:`MutablePod`.
-
-    Useful in Flow API
+class RemoteMutablePod(RemotePod):
+    """REST based Mutable pod to be used while invoking remote Pod via Flow API
     """
-    remote_helper = MutablePodSpawnHelper
+
+    @cached_property
+    def remote_id(self) -> str:
+        return self.spawn_remote(host=self.args['peas'][0].host, port=self.args['peas'][0].port_expose)
+
+    def spawn_remote(self, host: str, port: int, pod_type: str = 'flow', **kwargs) -> Optional[str]:
+        return super().spawn_remote(host, port, pod_type=pod_type)
+
+    def close(self):
+        self.delete_remote()
