@@ -1,13 +1,13 @@
-from typing import Iterable, List, Any, Union
+from typing import List, Any, Union
 
 import numpy as np
 
 from . import BaseExecutableDriver
-from .helper import extract_docs
-from ..proto.ndarray.generic import GenericNdArray
+from ..helper import typename
+from ..types.document import Document
 
 if False:
-    from ..proto import jina_pb2
+    from ..types.sets import DocumentSet
 
 
 class BasePredictDriver(BaseExecutableDriver):
@@ -31,19 +31,19 @@ class BaseLabelPredictDriver(BasePredictDriver):
 
     def _apply_all(
             self,
-            docs: Iterable['jina_pb2.Document'],
-            context_doc: 'jina_pb2.Document',
+            docs: 'DocumentSet',
+            context_doc: 'Document',
             field: str,
             *args,
             **kwargs,
     ) -> None:
-        embed_vecs, docs_pts, bad_doc_ids = extract_docs(docs, embedding=True)
+        embed_vecs, docs_pts, bad_docs = docs.all_embeddings
 
-        if bad_doc_ids:
-            self.pea.logger.warning(f'these bad docs can not be added: {bad_doc_ids}')
+        if bad_docs:
+            self.pea.logger.warning(f'these bad docs can not be added: {bad_docs}')
 
         if docs_pts:
-            prediction = self.exec_fn(np.stack(embed_vecs))
+            prediction = self.exec_fn(embed_vecs)
             labels = self.prediction2label(prediction)  # type: List[Union[str, List[str]]]
             for doc, label in zip(docs_pts, labels):
                 doc.tags[self.output_tag] = label
@@ -86,7 +86,7 @@ class BinaryPredictDriver(BaseLabelPredictDriver):
         """
         p = np.squeeze(prediction)
         if p.ndim > 1:
-            raise ValueError(f'{self.__class__} expects prediction has ndim=1, but receiving ndim={p.ndim}')
+            raise ValueError(f'{typename(self)} expects prediction has ndim=1, but receiving ndim={p.ndim}')
 
         return [self.one_label if v else self.zero_label for v in p.astype(bool)]
 
@@ -106,10 +106,10 @@ class OneHotPredictDriver(BaseLabelPredictDriver):
 
     def validate_labels(self, prediction: 'np.ndarray'):
         if prediction.ndim != 2:
-            raise ValueError(f'{self.__class__} expects prediction has ndim=2, but receiving {prediction.ndim}')
+            raise ValueError(f'{typename(self)} expects prediction has ndim=2, but receiving {prediction.ndim}')
         if prediction.shape[1] != len(self.labels):
             raise ValueError(
-                f'{self.__class__} expects prediction.shape[1]==len(self.labels), but receiving {prediction.shape}')
+                f'{typename(self)} expects prediction.shape[1]==len(self.labels), but receiving {prediction.shape}')
 
     def prediction2label(self, prediction: 'np.ndarray') -> List[str]:
         """
@@ -146,18 +146,18 @@ class Prediction2DocBlobDriver(BasePredictDriver):
 
     def _apply_all(
             self,
-            docs: Iterable['jina_pb2.Document'],
-            context_doc: 'jina_pb2.Document',
+            docs: 'DocumentSet',
+            context_doc: 'Document',
             field: str,
             *args,
             **kwargs,
     ) -> None:
-        embed_vecs, docs_pts, bad_doc_ids = extract_docs(docs, embedding=True)
+        embed_vecs, docs_pts, bad_docs = docs.all_embeddings
 
-        if bad_doc_ids:
-            self.pea.logger.warning(f'these bad docs can not be added: {bad_doc_ids}')
+        if bad_docs:
+            self.pea.logger.warning(f'these bad docs can not be added: {bad_docs}')
 
         if docs_pts:
-            prediction = self.exec_fn(np.stack(embed_vecs))
+            prediction = self.exec_fn(embed_vecs)
             for doc, pred in zip(docs_pts, prediction):
-                GenericNdArray(doc.blob).value = pred
+                doc.blob = pred

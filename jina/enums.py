@@ -232,14 +232,14 @@ class PodRoleType(BetterEnum):
         return self.value in {2, 4}
 
 
-class ClientMode(BetterEnum):
+class RequestType(BetterEnum):
     """ The enum of Client mode
 
     """
     INDEX = 0
     SEARCH = 1
     TRAIN = 2
-    EVALUATE = 3
+    CONTROL = 3
 
 
 class CompressAlgo(BetterEnum):
@@ -290,3 +290,37 @@ class FlowInspectType(BetterEnum):
         :return: if this socket is using `bind` protocol
         """
         return self.value in {0, 2}
+
+
+class CallbackOnType(BetterEnum):
+    """Apply the callback_fn on which field of the request """
+
+    REQUEST = 0  # the full request object
+    BODY = 1  # the body of the request, `status`, `routes` and `queryset` are removed
+    DOCS = 2  # the documents inside the request body
+    GROUNDTRUTHS = 3  # the groundtruths inside the request body
+
+
+class RemoteAccessType(BetterEnum):
+    """Remote access type when connect to the host """
+
+    SSH = 0  # ssh connection
+    JINAD = 1  # using rest api via jinad
+
+
+class BuildTestLevel(BetterEnum):
+    """Test level in :command:`jina hub build`, higher level includes lower levels """
+
+    NONE = 0  # no build test
+    EXECUTOR = 1  # test at executor level, directly use the config yaml
+    POD_NONDOCKER = 2  # test at pod level, directly use the config yaml
+    POD_DOCKER = 3  # test at pod level but pod --uses the built image
+    FLOW = 4  # test at a simple flow
+
+
+class DataInputType(BetterEnum):
+    """Data input type in the request generator """
+
+    AUTO = 0  # auto inference the input type from data (!WARN: could be slow as it relies on try-execept)
+    DOCUMENT = 1  # the input is a full document
+    CONTENT = 2  # the input is just the content of the document

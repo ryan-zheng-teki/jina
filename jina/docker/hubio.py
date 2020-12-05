@@ -8,15 +8,24 @@ import urllib.request
 import webbrowser
 from typing import Dict, Any
 
+from docker import DockerClient
+
+from jina import __version__ as jina_version
 from .checker import *
 from .helper import credentials_file
 from .hubapi import _list, _register_to_mongodb, _list_local
 from ..clients.python import ProgressBar
-from ..excepts import PeaFailToStart, DockerLoginFailed
+from ..enums import BuildTestLevel
+from ..excepts import DockerLoginFailed, HubBuilderError, HubBuilderBuildError, HubBuilderTestError
+from ..executors import BaseExecutor
+from ..flow import Flow
 from ..helper import colored, get_readable_size, get_now_timestamp, get_full_version, random_name, expand_dict, \
     countdown
+from ..importer import ImportExtensions
 from ..logging import JinaLogger
 from ..logging.profile import TimeContext
+from ..parser import set_pod_parser
+from ..peapods import Pod
 
 if False:
     import argparse
@@ -44,28 +53,23 @@ class HubIO:
         self._load_docker_client()
 
     def _load_docker_client(self):
-        try:
+        with ImportExtensions(required=False,
+                              help_text='missing "docker" dependency, available CLIs limited to "jina hub [list, new]"'
+                                        'to enable full CLI, please do pip install "jina[docker]"'):
             import docker
             from docker import APIClient
 
-            self._client = docker.from_env()
+            self._client: DockerClient = docker.from_env()
 
             # low-level client
             self._raw_client = APIClient(base_url='unix://var/run/docker.sock')
-        except (ImportError, ModuleNotFoundError):
-            self.logger.warning('missing "docker" dependency, available CLIs limited to "jina hub [list, new]"'
-                                'to enable full CLI, please do pip install "jina[docker]"')
 
     def new(self) -> None:
         """Create a new executor using cookiecutter template """
-        try:
+        with ImportExtensions(required=True):
             from cookiecutter.main import cookiecutter
-        except (ImportError, ModuleNotFoundError):
-            self.logger.critical('"jina hub new" requires "cookiecutter" dependency, '
-                                 'please install it via pip install "jina[cookiecutter]"')
-            raise
+            import click  # part of cookiecutter
 
-        import click  # part of cookiecutter
         cookiecutter_template = self.args.template
         if self.args.type == 'app':
             cookiecutter_template = 'https://github.com/jina-ai/cookiecutter-jina.git'
@@ -169,6 +173,16 @@ class HubIO:
         name = name or self.args.name
 
         try:
+            # check if image exists
+            # fail if it does
+            if self._image_version_exists(
+                    build_result['manifest_info']['name'],
+                    build_result['manifest_info']['version'],
+                    jina_version
+            ):
+                raise Exception(f'Image with name {name} already exists. Will NOT overwrite.')
+            else:
+                self.logger.debug(f'Image with name {name} does not exist. Pushing now...')
             self._push_docker_hub(name, readme_path)
 
             if not build_result:
@@ -251,8 +265,9 @@ class HubIO:
             if f'{_label_prefix}{r}' not in image.labels.keys():
                 self.logger.warning(f'{r} is missing in your docker image labels, you may want to check it')
         try:
+            image.labels['jina_version'] = jina_version
             if name != safe_url_name(
-                    f'{self.args.repository}/' + '{type}.{kind}.{name}:{version}'.format(
+                    f'{self.args.repository}/' + '{type}.{kind}.{name}:{version}-{jina_version}'.format(
                         **{k.replace(_label_prefix, ''): v for k, v in image.labels.items()})):
                 raise ValueError(f'image {name} does not match with label info in the image')
         except KeyError:
@@ -279,6 +294,7 @@ class HubIO:
         else:
             is_build_success, is_push_success = True, False
             _logs = []
+            _except_strs = []
             _excepts = []
 
             with TimeContext(f'building {colored(self.args.path, "green")}', self.logger) as tc:
@@ -299,7 +315,7 @@ class HubIO:
                             for line in chunk['stream'].splitlines():
                                 if is_error_message(line):
                                     self.logger.critical(line)
-                                    _excepts.append(line)
+                                    _except_strs.append(line)
                                 elif 'warning' in line.lower():
                                     self.logger.warning(line)
                                 else:
@@ -308,7 +324,9 @@ class HubIO:
                 except Exception as ex:
                     # if pytest fails it should end up here as well
                     is_build_success = False
-                    _excepts.append(str(ex))
+                    ex = HubBuilderBuildError(ex)
+                    _except_strs.append(repr(ex))
+                    _excepts.append(ex)
 
             if is_build_success:
                 # compile it again, but this time don't show the log
@@ -336,25 +354,24 @@ class HubIO:
 
             if is_build_success:
                 if self.args.test_uses:
-                    from jina.excepts import ModelCheckpointNotExist
+                    p_names = []
                     try:
                         is_build_success = False
-                        from jina.flow import Flow
-                        p_name = random_name()
-                        with Flow().add(name=p_name, uses=image.tags[0], daemon=self.args.daemon):
-                            pass
-
-                        if self.args.daemon:
-                            self._raw_client.stop(p_name)
-                        self._raw_client.prune_containers()
+                        p_names = self._test_build(image)
                         is_build_success = True
-                    except ModelCheckpointNotExist:
-                        self.logger.warning(f' Pretrained Model File Does not Exist is considered as a test passing')
-                        is_build_success = True
-                    except PeaFailToStart:
-                        self.logger.error(f'can not use it in the Flow, please check your file bundle')
                     except Exception as ex:
-                        self.logger.error(f'something wrong but it is probably not your fault. {repr(ex)}')
+                        self.logger.error(f'something wrong while testing the build: {repr(ex)}')
+                        ex = HubBuilderTestError(ex)
+                        _except_strs.append(repr(ex))
+                        _excepts.append(ex)
+                    finally:
+                        if self.args.daemon:
+                            try:
+                                for p in p_names:
+                                    self._raw_client.stop(p)
+                            except:
+                                pass  # suppress on purpose
+                        self._raw_client.prune_containers()
 
                 _version = self.manifest['version'] if 'version' in self.manifest else '0.0.1'
                 info, env_info = get_full_version()
@@ -370,7 +387,7 @@ class HubIO:
                 'host_info': _host_info if is_build_success and self.args.host_info else '',
                 'duration': tc.readable_duration,
                 'logs': _logs,
-                'exception': _excepts
+                'exception': _except_strs
             }
 
             if self.args.prune_images:
@@ -396,9 +413,38 @@ class HubIO:
         if not result['is_build_success'] and self.args.raise_error:
             # remove the very verbose build log when throw error
             result['build_history'].pop('logs')
-            raise RuntimeError(result)
+            raise HubBuilderError(_excepts)
 
         return result
+
+    def _test_build(self, image):
+        # test uses at executor level
+        if self.args.test_level >= BuildTestLevel.EXECUTOR:
+            with BaseExecutor.load_config(self.config_yaml_path):
+                pass
+
+        # test uses at Pod level (no docker)
+        if self.args.test_level >= BuildTestLevel.POD_NONDOCKER:
+            with Pod(set_pod_parser().parse_args(['--uses', self.config_yaml_path])):
+                pass
+
+        p_names = []
+        # test uses at Pod level (with docker)
+        if self.args.test_level >= BuildTestLevel.POD_DOCKER:
+            p_name = random_name()
+            with Pod(set_pod_parser().parse_args(['--uses', image.tags[0], '--name', p_name] +
+                                                 ['--daemon'] if self.args.daemon else [])):
+                pass
+            p_names.append(p_name)
+
+        # test uses at Flow level
+        if self.args.test_level >= BuildTestLevel.FLOW:
+            p_name = random_name()
+            with Flow().add(name=random_name(), uses=image.tags[0], daemon=self.args.daemon):
+                pass
+            p_names.append(p_name)
+
+        return p_names
 
     def dry_run(self) -> Dict:
         try:
@@ -418,12 +464,15 @@ class HubIO:
     def _check_completeness(self) -> Dict:
         self.dockerfile_path = get_exist_path(self.args.path, 'Dockerfile')
         self.manifest_path = get_exist_path(self.args.path, 'manifest.yml')
+        self.config_yaml_path = get_exist_path(self.args.path, 'config.yml')
         self.readme_path = get_exist_path(self.args.path, 'README.md')
         self.requirements_path = get_exist_path(self.args.path, 'requirements.txt')
 
-        yaml_glob = glob.glob(os.path.join(self.args.path, '*.yml'))
-        if yaml_glob:
-            yaml_glob.remove(self.manifest_path)
+        yaml_glob = set(glob.glob(os.path.join(self.args.path, '*.yml')))
+        yaml_glob.difference_update({self.manifest_path, self.config_yaml_path})
+
+        if not self.config_yaml_path:
+            self.config_yaml_path = yaml_glob.pop()
 
         py_glob = glob.glob(os.path.join(self.args.path, '*.py'))
 
@@ -432,6 +481,7 @@ class HubIO:
         completeness = {
             'Dockerfile': self.dockerfile_path,
             'manifest.yml': self.manifest_path,
+            'config.yml': self.config_yaml_path,
             'README.md': self.readme_path,
             'requirements.txt': self.requirements_path,
             '*.yml': yaml_glob,
@@ -441,7 +491,7 @@ class HubIO:
 
         self.logger.info(
             f'completeness check\n' +
-            '\n'.join('%4s %-20s %s' % (colored('✓', 'green') if v else colored('✗', 'red'), k, v) for k, v in
+            '\n'.join(f'{colored("✓", "green") if v else colored("✗", "red"):>4} {k:<20} {v}' for k, v in
                       completeness.items()) + '\n')
 
         if completeness['Dockerfile'] and completeness['manifest.yml']:
@@ -452,8 +502,10 @@ class HubIO:
 
         self.manifest = self._read_manifest(self.manifest_path)
         self.dockerfile_path_revised = self._get_revised_dockerfile(self.dockerfile_path, self.manifest)
-        self.tag = safe_url_name(f'{self.args.repository}/' + '{type}.{kind}.{name}:{version}'.format(**self.manifest))
-        self.canonical_name = safe_url_name(f'{self.args.repository}/' + '{type}.{kind}.{name}'.format(**self.manifest))
+        tag_name = safe_url_name(
+            f'{self.args.repository}/' + f'{self.manifest["type"]}.{self.manifest["kind"]}.{self.manifest["name"]}:{self.manifest["version"]}-{jina_version}')
+        self.tag = tag_name
+        self.canonical_name = tag_name
         return completeness
 
     def _read_manifest(self, path: str, validate: bool = True) -> Dict:
@@ -546,3 +598,16 @@ class HubIO:
     # alias of "new" in cli
     create = new
     init = new
+
+    def _image_version_exists(self, name, module_version, req_jina_version):
+        manifests = _list(self.logger, name)
+        # check if matching module version and jina version exists
+        if manifests:
+            matching = [
+                m for m in manifests
+                if m['version'] == module_version
+                and 'jina_version' in m.keys()
+                and m['jina_version'] == req_jina_version
+            ]
+            return len(matching) > 0
+        return True

@@ -6,7 +6,6 @@ import pickle
 import re
 import subprocess
 import tempfile
-import uuid
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +17,8 @@ from ruamel.yaml import StringIO
 from .decorators import as_train_method, as_update_method, store_init_kwargs, as_aggregate_method, wrap_func
 from .metas import get_default_metas, fill_metas_with_defaults
 from ..excepts import EmptyExecutorYAML, BadWorkspace, BadPersistantFile, NoDriverForRequest, UnattachedDriver
-from ..helper import yaml, PathImporter, expand_dict, expand_env_var, get_local_config_source
+from ..helper import yaml, expand_dict, expand_env_var, get_local_config_source, typename, get_random_identity
+from ..importer import PathImporter
 from ..logging import JinaLogger
 from ..logging.profile import TimeContext
 
@@ -118,6 +118,7 @@ class BaseExecutor(metaclass=ExecutorType):
 
     """
     store_args_kwargs = False  #: set this to ``True`` to save ``args`` (in a list) and ``kwargs`` (in a map) in YAML config
+    exec_methods = ['encode', 'add', 'query', 'craft', 'score', 'evaluate', 'predict', 'query_by_id']
 
     def __init__(self, *args, **kwargs):
         if isinstance(args, tuple) and len(args) > 0:
@@ -142,7 +143,7 @@ class BaseExecutor(metaclass=ExecutorType):
                 self.on_gpu = False
 
     def _post_init_wrapper(self, _metas: Dict = None, _requests: Dict = None, fill_in_metas: bool = True) -> None:
-        with TimeContext('post initiating, this may take some time', self.logger):
+        with TimeContext('post_init may take some time', self.logger):
             if fill_in_metas:
                 if not _metas:
                     _metas = get_default_metas()
@@ -154,8 +155,8 @@ class BaseExecutor(metaclass=ExecutorType):
                 self._fill_metas(_metas)
                 self._fill_requests(_requests)
 
-            _before = set(list(vars(self).keys()))
             self._check_on_gpu()
+            _before = set(list(vars(self).keys()))
             self.post_init()
             self._post_init_vars = {k for k in vars(self) if k not in _before}
 
@@ -191,13 +192,13 @@ class BaseExecutor(metaclass=ExecutorType):
             elif type(getattr(self, k)) == type(v):
                 setattr(self, k, v)
         if not getattr(self, 'name', None):
-            _id = str(uuid.uuid4()).split('-')[0]
-            _name = f'{self.__class__.__name__}-{_id}'
-            if self.warn_unnamed:
+            _id = get_random_identity().split('-')[0]
+            _name = f'{typename(self)}-{_id}'
+            if getattr(self, 'warn_unnamed', False):
                 self.logger.warning(
-                    'this executor is not named, i will call it "%s". '
+                    f'this executor is not named, i will call it "{_name}". '
                     'naming is important as it provides an unique identifier when '
-                    'persisting this executor on disk.' % _name)
+                    'persisting this executor on disk.')
             setattr(self, 'name', _name)
         if unresolved_attr:
             _tmp = vars(self)
@@ -298,9 +299,10 @@ class BaseExecutor(metaclass=ExecutorType):
         self.logger = JinaLogger(self.__class__.__name__)
         try:
             self._post_init_wrapper(fill_in_metas=False)
-        except ImportError as ex:
-            self.logger.warning('ImportError is often caused by a missing component, '
-                                'which often can be solved by "pip install" relevant package. %s' % ex, exc_info=True)
+        except ModuleNotFoundError as ex:
+            self.logger.warning(f'{typename(ex)} is often caused by a missing component, '
+                                f'which often can be solved by "pip install" relevant package: {repr(ex)}',
+                                exc_info=True)
 
     def train(self, *args, **kwargs) -> None:
         """
@@ -344,7 +346,7 @@ class BaseExecutor(metaclass=ExecutorType):
             f = tempfile.NamedTemporaryFile('w', delete=False, dir=os.environ.get('JINA_EXECUTOR_WORKDIR', None)).name
 
         if self.max_snapshot > 0 and os.path.exists(f):
-            bak_f = f + '.snapshot-%s' % (self._last_snapshot_ts.strftime('%Y%m%d%H%M%S') or 'NA')
+            bak_f = f + f'.snapshot-{self._last_snapshot_ts.strftime("%Y%m%d%H%M%S") or "NA"}'
             os.rename(f, bak_f)
             self._snapshot_files.append(bak_f)
             if len(self._snapshot_files) > self.max_snapshot:
@@ -372,7 +374,7 @@ class BaseExecutor(metaclass=ExecutorType):
             f = tempfile.NamedTemporaryFile('w', delete=False, dir=os.environ.get('JINA_EXECUTOR_WORKDIR', None)).name
         with open(f, 'w', encoding='utf8') as fp:
             yaml.dump(self, fp)
-        self.logger.info('executor\'s yaml config is save to %s' % f)
+        self.logger.info(f'executor\'s yaml config is save to {f}')
 
         self.is_updated = _updated
         return True

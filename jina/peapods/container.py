@@ -3,16 +3,14 @@ __license__ = "Apache-2.0"
 
 import os
 import asyncio
-
+import time
 from pathlib import Path
 
 from .pea import BasePea
-from .zmq import send_ctrl_message
-from ..proto import jina_pb2
-from .. import __ready_msg__, __unable_to_load_pretrained_model_msg__
+from .zmq import send_ctrl_message, Zmqlet
+from .. import __ready_msg__
 from ..helper import is_valid_local_config_source, kwargs2list, get_non_defaults_args
 from ..logging import JinaLogger
-from ..logging.queue import clear_queues
 
 
 class ContainerPea(BasePea):
@@ -61,48 +59,65 @@ class ContainerPea(BasePea):
             _expose_port.append(self.args.port_out)
 
         from sys import platform
-        if platform == "linux" or platform == "linux2":
+        if platform in ('linux', 'linux2'):
             net_mode = 'host'
         else:
             net_mode = None
 
         _args = kwargs2list(non_defaults)
+        ports = {f'{v}/tcp': v for v in _expose_port} if not net_mode else None
         self._container = self._client.containers.run(self.args.uses, _args,
                                                       detach=True, auto_remove=True,
-                                                      ports={f'{v}/tcp': v for v in
-                                                             _expose_port},
+                                                      ports=ports,
                                                       name=self.name,
                                                       volumes=_volumes,
                                                       network_mode=net_mode,
-                                                      entrypoint=self.args.entrypoint,
-                                                      # publish_all_ports=True # This looks like something I would
-                                                      # activate
-                                                      )
+                                                      entrypoint=self.args.entrypoint)
+
+        # Related to potential docker-in-docker communication. If `ContainerPea` lives already inside a container.
+        # it will need to communicate using the `bridge` network.
+        if platform in ('linux', 'linux2'):
+            try:
+                bridge_network = self._client.networks.get('bridge')
+                if bridge_network:
+                    self.ctrl_addr, self.ctrl_with_ipc = Zmqlet.get_ctrl_address(
+                        bridge_network.attrs['IPAM']['Config'][0]['Gateway'],
+                        self.args.port_ctrl,
+                        self.args.ctrl_with_ipc)
+            except Exception as exc:
+                self.logger.warning(f'Unable to set control address from "bridge" network: {repr(exc)}'
+                                    f' Control address set to {self.ctrl_addr}')
+            finally:
+                pass
         # wait until the container is ready
         self.logger.info('waiting ready signal from the container')
 
     def loop_body(self):
         """Direct the log from the container to local console """
-        import docker
 
-        logger = JinaLogger('🐳', **vars(self.args))
+        def check_ready():
+            # TODO: This needs to be fixed, sleep needs to be awaited
+            while not self.is_ready:
+                time.sleep(0.1)
+            self.is_ready_event.set()
+            self.logger.success(__ready_msg__)
+            return True
 
-        with logger:
-            try:
-                for line in self._container.logs(stream=True):
-                    msg = line.strip().decode()
-                    logger.info(msg)
-                    # this is shabby, but it seems the only easy way to detect is_pretrained_model_exception signal,
-                    # so that it can be raised during an executor hub build (hub --test-uses). This exception
-                    # is raised during executor load and before the `ZMQ` is configured and ready to get requests
-                    # and communicate
-                    if __ready_msg__ in msg:
-                        self.is_ready_event.set()
-                        self.logger.success(__ready_msg__)
-                    if __unable_to_load_pretrained_model_msg__ in msg:
-                        self.is_pretrained_model_exception.set()
-            except docker.errors.NotFound:
-                self.logger.error('the container can not be started, check your arguments, entrypoint')
+        async def _loop_body():
+            import docker
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, check_ready)
+
+            logger = JinaLogger('🐳', **vars(self.args))
+
+            with logger:
+                try:
+                    for line in self._container.logs(stream=True):
+                        logger.info(line.strip().decode())
+                except docker.errors.NotFound:
+                    self.logger.error('the container can not be started, check your arguments, entrypoint')
+
+        asyncio.run(_loop_body())
 
     def loop_teardown(self):
         """Stop the container """
@@ -120,17 +135,16 @@ class ContainerPea(BasePea):
     def status(self):
         """Send the control signal ``STATUS`` to itself and return the status """
         if getattr(self, 'ctrl_addr'):
-            return send_ctrl_message(self.ctrl_addr, jina_pb2.Request.ControlRequest.STATUS,
+            return send_ctrl_message(self.ctrl_addr, 'STATUS',
                                      timeout=self.args.timeout_ctrl)
 
     @property
     def is_ready(self) -> bool:
         status = self.status
-        return status and status.envelope.status.code == jina_pb2.Status.READY
+        return status and status.is_ready
 
     def close(self) -> None:
         self.send_terminate_signal()
         if not self.daemon:
-            clear_queues()
             self.logger.close()
             self.join()

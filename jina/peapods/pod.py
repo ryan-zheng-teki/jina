@@ -6,7 +6,6 @@ import copy
 import time
 from argparse import Namespace
 from contextlib import ExitStack
-from queue import Empty
 from threading import Thread
 from typing import Optional, Set, Dict, List, Callable, Union
 
@@ -17,7 +16,7 @@ from .tail_pea import TailPea
 from .. import __default_host__
 from ..enums import *
 from ..helper import random_port, get_random_identity, get_parsed_args, get_non_defaults_args, \
-    is_valid_local_config_source
+    is_valid_local_config_source, get_internal_ip, get_public_ip
 from ..parser import set_pod_parser, set_gateway_parser
 
 
@@ -61,17 +60,43 @@ class BasePod(ExitStack):
     @property
     def name(self) -> str:
         """The name of this :class:`BasePod`. """
-        return self.peas_args['peas'][0].name
+        return self.first_pea_args.name
 
     @property
     def port_expose(self) -> int:
         """Get the grpc port number """
-        return self.peas_args['peas'][0].port_expose
+        return self.first_pea_args.port_expose
 
     @property
     def host(self) -> str:
-        """Get the grpc host name """
-        return self.peas_args['peas'][0].host
+        """Get the host name of this Pod"""
+        return self.first_pea_args.host
+
+    @property
+    def host_in(self) -> str:
+        """Get the host_in of this pod"""
+        return self.head_args.host_in
+
+    @property
+    def host_out(self) -> str:
+        """Get the host_out of this pod"""
+        return self.tail_args.host_out
+
+    @property
+    def address_in(self) -> str:
+        """Get the full incoming address of this pod"""
+        return f'{self.head_args.host_in}:{self.head_args.port_in} ({self.head_args.socket_in!s})'
+
+    @property
+    def address_out(self) -> str:
+        """Get the full outgoing address of this pod"""
+        return f'{self.tail_args.host_out}:{self.tail_args.port_out} ({self.head_args.socket_out!s})'
+
+    @property
+    def first_pea_args(self) -> Namespace:
+        """Return the first non-head/tail pea's args """
+        # note this will be never out of boundary
+        return self.peas_args['peas'][0]
 
     def _parse_args(self, args: Namespace) -> Dict[str, Optional[Union[List[Namespace], Namespace]]]:
         peas_args = {
@@ -103,7 +128,6 @@ class BasePod(ExitStack):
             self.is_tail_router = False
             peas_args['peas'] = [args]
 
-
         # note that peas_args['peas'][0] exist either way and carries the original property
         return peas_args
 
@@ -113,7 +137,7 @@ class BasePod(ExitStack):
         if self.is_head_router and self.peas_args['head']:
             return self.peas_args['head']
         elif not self.is_head_router and len(self.peas_args['peas']) == 1:
-            return self.peas_args['peas'][0]
+            return self.first_pea_args
         elif self.deducted_head:
             return self.deducted_head
         else:
@@ -125,7 +149,7 @@ class BasePod(ExitStack):
         if self.is_head_router and self.peas_args['head']:
             self.peas_args['head'] = args
         elif not self.is_head_router and len(self.peas_args['peas']) == 1:
-            self.peas_args['peas'][0] = args
+            self.peas_args['peas'][0] = args  # weak reference
         elif self.deducted_head:
             self.deducted_head = args
         else:
@@ -137,7 +161,7 @@ class BasePod(ExitStack):
         if self.is_tail_router and self.peas_args['tail']:
             return self.peas_args['tail']
         elif not self.is_tail_router and len(self.peas_args['peas']) == 1:
-            return self.peas_args['peas'][0]
+            return self.first_pea_args
         elif self.deducted_tail:
             return self.deducted_tail
         else:
@@ -149,7 +173,7 @@ class BasePod(ExitStack):
         if self.is_tail_router and self.peas_args['tail']:
             self.peas_args['tail'] = args
         elif not self.is_tail_router and len(self.peas_args['peas']) == 1:
-            self.peas_args['peas'][0] = args
+            self.peas_args['peas'][0] = args  # weak reference
         elif self.deducted_tail:
             self.deducted_tail = args
         else:
@@ -190,7 +214,7 @@ class BasePod(ExitStack):
         for t in self.sentinel_threads:
             t.start()
 
-    def start(self) -> 'FlowPod':
+    def start(self) -> 'BasePod':
         """Start to run all Peas in this BasePod.
 
         Remember to close the BasePod with :meth:`close`.
@@ -227,30 +251,10 @@ class BasePod(ExitStack):
         return self
 
     @property
-    def log_iterator(self):
-        """Get the last log using iterator
-
-        The :class:`BasePod` log iterator goes through all peas :attr:`log_iterator` and
-        poll them sequentially. If non all them is active anymore, aka :attr:`is_event_loop`
-        is False, then the iterator ends.
-
-        .. warning::
-
-            The log may not strictly follow the time order given that we are polling the log
-            from all peas in the sequential manner.
-        """
-        from ..logging.queue import __log_queue__
-        while not self.is_shutdown:
-            try:
-                yield __log_queue__.get_nowait()
-            except Empty:
-                pass
-
-    @property
     def is_shutdown(self) -> bool:
         return all(not p.is_ready_event.is_set() for p in self.peas)
 
-    def __enter__(self) -> Union['GatewayFlowPod', 'FlowPod']:
+    def __enter__(self) -> 'BasePod':
         return self.start()
 
     @property
@@ -298,8 +302,11 @@ class FlowPod(BasePod):
 
     """
 
-    def __init__(self, kwargs: Dict,
-                 needs: Set[str] = None, parser: Callable = set_pod_parser, pod_role: 'PodRoleType' = PodRoleType.POD):
+    def __init__(self,
+                 kwargs: Dict,
+                 needs: Set[str] = None,
+                 parser: Callable = set_pod_parser,
+                 pod_role: 'PodRoleType' = PodRoleType.POD):
         """
 
         :param kwargs: unparsed argument in dict, if given the
@@ -342,8 +349,6 @@ class FlowPod(BasePod):
             second.head_args.host_in = __default_host__
             first.tail_args.port_out = second.head_args.port_in
         elif first_socket_type == SocketType.PUB_BIND:
-            if not second.role.is_inspect:
-                first.tail_args.num_part += 1
             first.tail_args.host_out = __default_host__  # bind always get default 0.0.0.0
             second.head_args.host_in = _fill_in_host(bind_args=first.tail_args,
                                                      connect_args=second.head_args)  # the hostname of s_pod
@@ -388,8 +393,15 @@ class FlowPod(BasePod):
         if self._args.host == __default_host__:
             return super().start()
         else:
-            from .remote import RemoteMutablePod
-            _remote_pod = RemoteMutablePod(self.peas_args)
+            if self._args.remote_access == RemoteAccessType.JINAD:
+                from .remote import RemoteMutablePod
+                _remote_pod = RemoteMutablePod(self.peas_args)
+            elif self._args.remote_access == RemoteAccessType.SSH:
+                from .ssh import RemoteSSHMutablePod
+                _remote_pod = RemoteSSHMutablePod(self.peas_args)
+            else:
+                raise ValueError(f'{self._args.remote_access} is unsupported')
+
             self.enter_context(_remote_pod)
             self.start_sentinels()
             return self
@@ -405,6 +417,7 @@ def _set_peas_args(args: Namespace, head_args: Namespace = None, tail_args: Name
             _args.port_out = tail_args.port_in
         _args.port_ctrl = random_port()
         _args.identity = get_random_identity()
+        _args.log_id = args.log_id
         _args.socket_out = SocketType.PUSH_CONNECT
         if args.polling.is_push:
             if args.scheduling == SchedulerType.ROUND_ROBIN:
@@ -447,16 +460,19 @@ def _copy_to_head_args(args: Namespace, is_push: bool, as_router: bool = True) -
         elif args.scheduling == SchedulerType.LOAD_BALANCE:
             _head_args.socket_out = SocketType.ROUTER_BIND
             if as_router:
-                _head_args.uses = args.uses_before or '_route'
+                _head_args.uses = args.uses_before or '_pass'
     else:
         _head_args.socket_out = SocketType.PUB_BIND
-        _head_args.num_part = args.parallel
         if as_router:
             _head_args.uses = args.uses_before or '_pass'
 
     if as_router:
         _head_args.name = args.name or ''
         _head_args.role = PeaRoleType.HEAD
+
+    # in any case, if header is present, it represent this Pod to consume `num_part`
+    # the following peas inside the pod will have num_part=1
+    args.num_part = 1
 
     return _head_args
 
@@ -471,36 +487,53 @@ def _copy_to_tail_args(args: Namespace, as_router: bool = True) -> Namespace:
     _tail_args.uses = None
 
     if as_router:
-        _tail_args.uses = args.uses_after or '_merge'
+        _tail_args.uses = args.uses_after or '_pass'
         _tail_args.name = args.name or ''
         _tail_args.role = PeaRoleType.TAIL
+        _tail_args.num_part = 1 if args.polling.is_push else args.parallel
 
     return _tail_args
 
 
 def _fill_in_host(bind_args: Namespace, connect_args: Namespace) -> str:
+    """Compute the host address for ``connect_args`` """
     from sys import platform
 
-    bind_local = (bind_args.host == '0.0.0.0')
-    conn_local = (connect_args.host == '0.0.0.0')
-    conn_docker = (
-            getattr(connect_args, 'uses', None) is not None and not is_valid_local_config_source(connect_args.uses))
-    bind_conn_same_remote = not bind_local and not conn_local and (bind_args.host == connect_args.host)
-    if platform == "linux" or platform == "linux2":
-        local_host = '0.0.0.0'
+    # by default __default_host__ is 0.0.0.0
+
+    # is BIND at local
+    bind_local = (bind_args.host == __default_host__)
+
+    # is CONNECT at local
+    conn_local = (connect_args.host == __default_host__)
+
+    # is CONNECT inside docker?
+    conn_docker = (getattr(connect_args, 'uses', None) is not None and
+                   not is_valid_local_config_source(connect_args.uses))
+
+    # is BIND & CONNECT all on the same remote?
+    bind_conn_same_remote = not bind_local and not conn_local and \
+                            (bind_args.host == connect_args.host)
+
+    if platform in ('linux', 'linux2'):
+        local_host = __default_host__
     else:
         local_host = 'host.docker.internal'
 
-    if bind_local and conn_local and conn_docker:
-        return local_host
-    elif bind_local and conn_local and not conn_docker:
-        return __default_host__
-    elif not bind_local and bind_conn_same_remote:
-        if conn_docker:
-            return local_host
-        else:
-            return __default_host__
+    # pod1 in local, pod2 in local (conn_docker if pod2 in docker)
+    if bind_local and conn_local:
+        return local_host if conn_docker else __default_host__
+
+    # pod1 and pod2 are remote but they are in the same host (pod2 is local w.r.t pod1)
+    if bind_conn_same_remote:
+        return local_host if conn_docker else __default_host__
+
+    # From here: Missing consideration of docker
+    if bind_local and not conn_local:
+        # in this case we are telling CONN (at remote) our local ip address
+        return get_public_ip() if bind_args.expose_public else get_internal_ip()
     else:
+        # in this case we (at local) need to know about remote the BIND address
         return bind_args.host
 
 

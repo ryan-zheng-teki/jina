@@ -2,7 +2,6 @@ import os
 import time
 from sys import platform
 
-import numpy as np
 import pytest
 
 from jina.checker import NetworkChecker
@@ -11,8 +10,11 @@ from jina.helper import random_name
 from jina.parser import set_pea_parser, set_ping_parser
 from jina.peapods.container import ContainerPea
 from jina.peapods.pea import BasePea
-from jina.proto import jina_pb2, uid
-from jina.proto.ndarray.generic import GenericNdArray
+from jina.proto import jina_pb2
+from jina.types.document import uid
+from jina.types.ndarray.generic import NdArray
+
+from tests import random_docs
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -20,26 +22,6 @@ img_name = 'jina/mwu-encoder'
 
 defaulthost = '0.0.0.0'
 localhost = defaulthost if (platform == "linux" or platform == "linux2") else 'host.docker.internal'
-
-
-def random_docs(num_docs, chunks_per_doc=5, embed_dim=10, jitter=1):
-    c_id = 3 * num_docs  # avoid collision with docs
-    for j in range(num_docs):
-        d = jina_pb2.Document()
-        d.tags['id'] = j
-        d.text = b'hello world'
-        GenericNdArray(d.embedding).value = np.random.random([embed_dim + np.random.randint(0, jitter)])
-        d.id = uid.new_doc_id(d)
-        for k in range(chunks_per_doc):
-            c = d.chunks.add()
-            c.text = 'i\'m chunk %d from doc %d' % (c_id, j)
-            GenericNdArray(c.embedding).value = np.random.random([embed_dim + np.random.randint(0, jitter)])
-            c.tags['id'] = c_id
-            c.tags['parent_id'] = j
-            c_id += 1
-            c.parent_id = d.id
-            c.id = uid.new_doc_id(c)
-        yield d
 
 
 @pytest.fixture(scope='module')
@@ -130,7 +112,7 @@ def test_flow_topo_mixed(docker_image_built):
 def test_flow_topo_parallel(docker_image_built):
     f = (Flow()
          .add(name='d7', uses='jinaai/jina:test-pip', entrypoint='jina pod', uses_internal='_pass', parallel=3)
-         .add(name='d8', uses='_pass', parallel=3)
+         .add(name='d8', parallel=3)
          .add(name='d9', uses='jinaai/jina:test-pip', entrypoint='jina pod', uses_internal='_pass',
               needs='d7')
          .join(['d9', 'd8']))
@@ -169,7 +151,7 @@ def test_container_ping(docker_image_built):
 def test_tail_host_docker2local_parallel(docker_image_built):
     f = (Flow()
          .add(name='d10', uses='jinaai/jina:test-pip', entrypoint='jina pod', uses_internal='_pass', parallel=3)
-         .add(name='d11', uses='_pass'))
+         .add(name='d11'))
     with f:
         assert getattr(f._pod_nodes['d10'].peas_args['tail'], 'host_out') == defaulthost
         f.dry_run()
@@ -178,7 +160,7 @@ def test_tail_host_docker2local_parallel(docker_image_built):
 def test_tail_host_docker2local(docker_image_built):
     f = (Flow()
          .add(name='d12', uses='jinaai/jina:test-pip', entrypoint='jina pod', uses_internal='_pass')
-         .add(name='d13', uses='_pass'))
+         .add(name='d13'))
     with f:
         assert getattr(f._pod_nodes['d12'].tail_args, 'host_out') == localhost
         f.dry_run()
@@ -191,5 +173,5 @@ def test_container_status():
     pea = ContainerPea(args)
     assert not pea.is_ready
     with pea:
-        time.sleep(1.)
+        time.sleep(2.)
         assert pea.is_ready

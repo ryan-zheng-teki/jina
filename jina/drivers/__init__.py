@@ -2,16 +2,12 @@ __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
 import inspect
-from collections import defaultdict
 from functools import wraps
 from typing import (
     Any,
     Dict,
     Callable,
     Tuple,
-    Iterable,
-    Iterator,
-    List,
     Optional,
     Sequence,
 )
@@ -20,17 +16,20 @@ import ruamel.yaml.constructor
 from google.protobuf.struct_pb2 import Struct
 
 from ..enums import SkipOnErrorType
+from ..executors import BaseExecutor
 from ..executors.compound import CompoundExecutor
-from ..executors.decorators import as_reduce_method, wrap_func
-from ..helper import yaml
-from ..proto import jina_pb2
-from ..proto.message import ProtoMessage, LazyRequest
+from ..executors.decorators import wrap_func
+from ..helper import yaml, convert_tuple_to_list
 
 if False:
     # fix type-hint complain for sphinx and flake
     from ..peapods.pea import BasePea
     from ..executors import AnyExecutor
     from ..logging.logger import JinaLogger
+    from ..types.message import Message
+    from ..types.request import Request
+    from ..types.document import Document
+    from ..types.sets import QueryLangSet, DocumentSet
 
 
 def store_init_kwargs(func: Callable) -> Callable:
@@ -64,6 +63,7 @@ def store_init_kwargs(func: Callable) -> Callable:
             self._init_kwargs_dict.update(tmp)
         else:
             self._init_kwargs_dict = tmp
+        convert_tuple_to_list(self._init_kwargs_dict)
         f = func(self, *args, **kwargs)
         return f
 
@@ -127,7 +127,7 @@ class DriverType(type):
         reg_cls_set = getattr(cls, '_registered_class', set())
         if cls.__name__ not in reg_cls_set or getattr(cls, 'force_register', False):
             wrap_func(cls, ['__init__'], store_init_kwargs)
-            wrap_func(cls, ['__call__'], as_reduce_method)
+            # wrap_func(cls, ['__call__'], as_reduce_method)
 
             reg_cls_set.add(cls.__name__)
             setattr(cls, '_registered_class', reg_cls_set)
@@ -147,9 +147,7 @@ class BaseDriver(metaclass=DriverType):
 
     store_args_kwargs = False  #: set this to ``True`` to save ``args`` (in a list) and ``kwargs`` (in a map) in YAML config
 
-    def __init__(
-        self, priority: int = 0, expect_parts: Optional[int] = 1, *args, **kwargs
-    ):
+    def __init__(self, priority: int = 0, *args, **kwargs):
         """
 
         :param priority: the priority of its default arg values (hardcoded in Python). If the
@@ -158,18 +156,6 @@ class BaseDriver(metaclass=DriverType):
         self.attached = False  #: represent if this driver is attached to a :class:`jina.peapods.pea.BasePea` (& :class:`jina.executors.BaseExecutor`)
         self.pea = None  # type: Optional['BasePea']
         self._priority = priority
-        self._expect_parts = expect_parts
-
-        # all pending messages collected so far, key is the request id
-        self._pending_msgs = defaultdict(list)  # type: Dict[str, List['ProtoMessage']]
-
-        # all pointers of the docs, provide the weak ref to all docs in partial reqs
-        self.doc_pointers = {}  # type: Dict[str, Any]
-
-    @property
-    def expect_parts(self) -> int:
-        """The expected number of partial messages before trigger :meth:`__call__` """
-        return self._expect_parts or self.msg.num_part
 
     def attach(self, pea: 'BasePea', *args, **kwargs) -> None:
         """Attach this driver to a :class:`jina.peapods.pea.BasePea`
@@ -180,37 +166,37 @@ class BaseDriver(metaclass=DriverType):
         self.attached = True
 
     @property
-    def req(self) -> 'LazyRequest':
+    def req(self) -> 'Request':
         """Get the current (typed) request, shortcut to ``self.pea.request``"""
         return self.pea.request
 
     @property
-    def partial_reqs(self) -> Sequence['LazyRequest']:
+    def partial_reqs(self) -> Sequence['Request']:
         """The collected partial requests under the current ``request_id`` """
-        if self.expect_parts <= 1:
+        if self.expect_parts > 1:
+            return self.pea.partial_requests
+        else:
             raise ValueError(
-                f'trying to get collected requests even though expect_parts={self.expect_parts},'
-                f'maybe you want to use self.req instead?'
+                f'trying to access all partial requests, '
+                f'but {self.pea} has only one message'
             )
 
-        return [v.request for v in self._pending_msgs[self.envelope.request_id]]
+    @property
+    def expect_parts(self) -> int:
+        """The expected number of partial messages """
+        return self.pea.expect_parts
 
     @property
-    def msg(self) -> 'ProtoMessage':
+    def msg(self) -> 'Message':
         """Get the current request, shortcut to ``self.pea.message``"""
         return self.pea.message
 
     @property
-    def queryset(self) -> Iterator['jina_pb2.QueryLang']:
+    def queryset(self) -> 'QueryLangSet':
         if self.msg:
             return self.msg.request.queryset
         else:
             return []
-
-    @property
-    def envelope(self) -> 'jina_pb2.Envelope':
-        """Get the current request, shortcut to ``self.pea.message``"""
-        return self.msg.envelope
 
     @property
     def logger(self) -> 'JinaLogger':
@@ -270,17 +256,19 @@ class BaseRecursiveDriver(BaseDriver):
         super().__init__(*args, **kwargs)
         self._traversal_paths = [path.lower() for path in traversal_paths]
 
+    # TODO(Han): probably want to publicize this, as it is not obvious for driver
+    #  developer which one should be inherited
     def _apply_all(
         self,
-        docs: Iterable['jina_pb2.Document'],
-        context_doc: 'jina_pb2.Document',
+        docs: 'DocumentSet',
+        context_doc: 'Document',
         field: str,
         *args,
         **kwargs,
     ) -> None:
         """Apply function works on a list of docs, modify the docs in-place
 
-        :param docs: a list of :class:`jina_pb2.Document` objects to work on; they could come from ``matches``/``chunks``.
+        :param docs: a list of :class:`jina.Document` objects to work on; they could come from ``matches``/``chunks``.
         :param context_doc: the owner of ``docs``
         :param field: where ``docs`` comes from, either ``matches`` or ``chunks``
         """
@@ -295,17 +283,13 @@ class BaseRecursiveDriver(BaseDriver):
     def __call__(self, *args, **kwargs):
         self._traverse_apply(self.docs, *args, **kwargs)
 
-    def _traverse_apply(
-        self, docs: Iterable['jina_pb2.Document'], *args, **kwargs
-    ) -> None:
+    def _traverse_apply(self, docs: 'DocumentSet', *args, **kwargs) -> None:
         for path in self._traversal_paths:
             if path[0] == 'r':
                 self._traverse_rec(docs, None, None, [], *args, **kwargs)
             for doc in docs:
                 self._traverse_rec(
-                    [
-                        doc,
-                    ],
+                    [doc],
                     None,
                     None,
                     path,
@@ -359,7 +343,7 @@ class BaseExecutableDriver(BaseRecursiveDriver):
     def exec_fn(self) -> Callable:
         """the function of :func:`jina.executors.BaseExecutor` to call """
         if (
-            self.envelope.status.code != jina_pb2.Status.ERROR
+            not self.msg.is_error
             or self.pea.args.skip_on_error < SkipOnErrorType.EXECUTOR
         ):
             return self._exec_fn
@@ -388,6 +372,12 @@ class BaseExecutableDriver(BaseRecursiveDriver):
             self._exec = executor
 
         if self._method_name:
+            if self._method_name not in BaseExecutor.exec_methods:
+                self.logger.warning(
+                    f'Using method {self._method_name} as driver execution function which is not registered'
+                    f'as a potential `exec_method` of an Executor. It won\'t work if used inside a CompoundExecutor'
+                )
+
             self._exec_fn = getattr(self.exec, self._method_name)
 
     def __getstate__(self) -> Dict[str, Any]:

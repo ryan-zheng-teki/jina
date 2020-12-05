@@ -1,21 +1,15 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Iterable, Tuple
+from typing import Tuple, Dict, Any
 
 import numpy as np
 
 from . import BaseRecursiveDriver
-from ..proto import jina_pb2
-from ..proto.ndarray.generic import GenericNdArray
 
-
-class ReduceDriver(BaseRecursiveDriver):
-    def __init__(self, *args, **kwargs):
-        super().__init__(expect_parts=None, *args, **kwargs)
-
-    def __call__(self, *args, **kwargs):
-        """Intentionally override traverse_apply with empty function"""
+if False:
+    from ..types.document import Document
+    from ..types.sets import DocumentSet
 
 
 class ReduceAllDriver(BaseRecursiveDriver):
@@ -27,12 +21,18 @@ class ReduceAllDriver(BaseRecursiveDriver):
     """
 
     def __init__(self, traversal_paths: Tuple[str] = ('c',), *args, **kwargs):
-        super().__init__(traversal_paths=traversal_paths, expect_parts=None, *args, **kwargs)
+        super().__init__(traversal_paths=traversal_paths, *args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        # all pointers of the docs, provide the weak ref to all docs in partial reqs
+        self.doc_pointers = {}  # type: Dict[str, Any]
+        self._traverse_apply(self.docs, *args, **kwargs)
+        self.doc_pointers.clear()
 
     def _apply_all(
             self,
-            docs: Iterable['jina_pb2.Document'],
-            context_doc: 'jina_pb2.Document',
+            docs: 'DocumentSet',
+            context_doc: 'Document',
             field: str,
             *args,
             **kwargs) -> None:
@@ -47,8 +47,8 @@ class CollectEvaluationDriver(ReduceAllDriver):
 
     def _apply_all(
             self,
-            docs: Iterable['jina_pb2.Document'],
-            context_doc: 'jina_pb2.Document',
+            docs: 'DocumentSet',
+            context_doc: 'Document',
             field: str,
             *args,
             **kwargs) -> None:
@@ -62,23 +62,25 @@ class ConcatEmbedDriver(ReduceAllDriver):
     """Concat all embeddings into one, grouped by ```doc.id``` """
 
     def __call__(self, *args, **kwargs):
+        # all pointers of the docs, provide the weak ref to all docs in partial reqs
+        self.doc_pointers = {}  # type: Dict[str, Any]
         self._traverse_apply(self.docs, *args, **kwargs)
         self._traverse_apply(self.req.docs, concatenate=True, *args, **kwargs)
+        self.doc_pointers.clear()
 
     def _apply_all(
             self,
-            docs: Iterable['jina_pb2.Document'],
-            context_doc: 'jina_pb2.Document',
+            docs: 'DocumentSet',
+            context_doc: 'Document',
             field: str,
             concatenate: bool = False,
             *args,
             **kwargs):
         doc = context_doc
         if concatenate:
-            GenericNdArray(doc.embedding).value = np.concatenate(self.doc_pointers[doc.id], axis=0)
+            doc.embedding = np.concatenate(self.doc_pointers[doc.id], axis=0)
         else:
             if doc.id not in self.doc_pointers:
-                self.doc_pointers[doc.id] = [GenericNdArray(doc.embedding).value]
+                self.doc_pointers[doc.id] = [doc.embedding]
             else:
-                self.doc_pointers[doc.id].append(GenericNdArray(doc.embedding).value)
-
+                self.doc_pointers[doc.id].append(doc.embedding)

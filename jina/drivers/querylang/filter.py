@@ -1,13 +1,13 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Dict, Any, Iterable
+from typing import Dict, Any
 
 from .queryset.lookup import Q
 from .. import QuerySetReader, BaseRecursiveDriver
 
 if False:
-    from ...proto import jina_pb2
+    from ...types.sets import DocumentSet
 
 
 class FilterQL(QuerySetReader, BaseRecursiveDriver):
@@ -36,7 +36,7 @@ class FilterQL(QuerySetReader, BaseRecursiveDriver):
         """
         self._lookups = lookups
 
-    def _apply_all(self, docs: Iterable['jina_pb2.Document'], *args, **kwargs) -> None:
+    def _apply_all(self, docs: 'DocumentSet', *args, **kwargs) -> None:
         if self.lookups:
             _lookups = Q(**self.lookups)
             miss_idx = []

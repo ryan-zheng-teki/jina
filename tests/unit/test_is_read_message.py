@@ -1,21 +1,20 @@
-import uuid
-
 from jina.logging import default_logger
 from jina.parser import set_pea_parser
 from jina.peapods.pea import BasePea
 from jina.peapods.zmq import Zmqlet
 from jina.proto import jina_pb2
-from jina.proto.message import ProtoMessage
+from jina.types.message import Message
+from jina.helper import get_random_identity
 
 
 class MockBasePeaNotRead(BasePea):
-    def post_hook(self, msg: 'ProtoMessage') -> 'BasePea':
+    def post_hook(self, msg: 'Message') -> 'BasePea':
         super().post_hook(msg)
         assert not msg.request.is_used
 
 
 class MockBasePeaRead(BasePea):
-    def post_hook(self, msg: 'ProtoMessage') -> 'BasePea':
+    def post_hook(self, msg: 'Message') -> 'BasePea':
         super().post_hook(msg)
         assert msg.request.is_used
 
@@ -54,19 +53,19 @@ args3 = set_pea_parser().parse_args([
 
 def test_read_zmqlet():
     with MockBasePeaRead(args2), Zmqlet(args1, default_logger) as z:
-        req = jina_pb2.Request()
-        req.request_id = uuid.uuid1().hex
+        req = jina_pb2.RequestProto()
+        req.request_id = get_random_identity()
         d = req.index.docs.add()
         d.tags['id'] = 2
-        msg = ProtoMessage(None, req, 'tmp', '')
+        msg = Message(None, req, 'tmp', '')
         z.send_message(msg)
 
 
 def test_not_read_zmqlet():
     with MockBasePeaNotRead(args3), Zmqlet(args1, default_logger) as z:
-        req = jina_pb2.Request()
-        req.request_id = uuid.uuid1().hex
+        req = jina_pb2.RequestProto()
+        req.request_id = get_random_identity()
         d = req.index.docs.add()
         d.tags['id'] = 2
-        msg = ProtoMessage(None, req, 'tmp', '')
+        msg = Message(None, req, 'tmp', '')
         z.send_message(msg)

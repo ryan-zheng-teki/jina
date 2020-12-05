@@ -2,39 +2,15 @@ __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
 from collections import defaultdict
-from typing import Iterable, Tuple, Dict, List
+from typing import Tuple, Dict, List
 
 import numpy as np
 
 from .encode import BaseEncodeDriver
-from ..proto import jina_pb2
-from ..proto.ndarray.generic import GenericNdArray
+from ..types.document.multimodal import MultimodalDocument
 
-
-def _extract_doc_content(doc: 'jina_pb2.Document'):
-    """Returns the content of the document with the following priority:
-    If the document has an embedding, return it, otherwise return its content.
-    """
-    r = GenericNdArray(doc.embedding).value
-    if r is not None:
-        return r
-    elif doc.text or doc.buffer:
-        return doc.text or doc.buffer
-    else:
-        return GenericNdArray(doc.blob).value
-
-
-def _extract_modalities_from_document(doc: 'jina_pb2.Document'):
-    """Returns a dictionary of document content (embedding, text, blob or buffer) with `modality` as its key
-    """
-    doc_content = {}
-    for chunk in doc.chunks:
-        modality = chunk.modality
-        if modality in doc_content:
-            return None
-        else:
-            doc_content[modality] = _extract_doc_content(chunk)
-    return doc_content
+if False:
+    from ..types.sets import DocumentSet
 
 
 class MultiModalDriver(BaseEncodeDriver):
@@ -80,7 +56,7 @@ class MultiModalDriver(BaseEncodeDriver):
 
     def _apply_all(
             self,
-            docs: Iterable['jina_pb2.Document'],
+            docs: 'DocumentSet',
             *args, **kwargs
     ) -> None:
         """
@@ -92,11 +68,12 @@ class MultiModalDriver(BaseEncodeDriver):
 
         valid_docs = []
         for doc in docs:
-            doc_content = _extract_modalities_from_document(doc)
-            if doc_content:
+            # convert to MultimodalDocument
+            doc = MultimodalDocument(doc)
+            if doc.modality_content_map:
                 valid_docs.append(doc)
                 for modality in self.positional_modality:
-                    content_by_modality[modality].append(doc_content[modality])
+                    content_by_modality[modality].append(doc[modality])
             else:
                 self.logger.warning(f'Invalid doc {doc.id}. Only one chunk per modality is accepted')
 
@@ -110,7 +87,7 @@ class MultiModalDriver(BaseEncodeDriver):
             embeds = self.exec_fn(*input_args)
             if len(valid_docs) != embeds.shape[0]:
                 self.logger.error(
-                    f'mismatched {len(valid_docs)} docs from level {docs[0].granularity} '
+                    f'mismatched {len(valid_docs)} docs from level {valid_docs[0].granularity} '
                     f'and a {embeds.shape} shape embedding, the first dimension must be the same')
             for doc, embedding in zip(valid_docs, embeds):
-                GenericNdArray(doc.embedding).value = embedding
+                doc.embedding = embedding

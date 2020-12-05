@@ -1,4 +1,5 @@
 import os
+import pytest
 
 from pkg_resources import resource_filename
 
@@ -9,8 +10,13 @@ from jina.parser import set_pea_parser
 from jina.peapods.pea import BasePea
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
-os.environ['TEST_WORKDIR'] = os.getcwd()
 
+@pytest.fixture(scope='function')
+def test_workspace(tmpdir):
+    os.environ['JINA_TEST_JOINT'] = str(tmpdir)
+    workspace_path = os.environ['JINA_TEST_JOINT']
+    yield workspace_path
+    del os.environ['JINA_TEST_JOINT']
 
 def test_yaml_expand():
     with open(os.path.join(cur_dir, 'yaml/test-expand.yml')) as fp:
@@ -73,7 +79,7 @@ def test_class_yaml():
     assert type(a) == DummyClass
 
     with open(resource_filename('jina',
-                                '/'.join(('resources', 'executors.requests.%s.yml' % 'BaseExecutor')))) as fp:
+                                '/'.join(('resources', 'executors.requests.BaseExecutor.yml')))) as fp:
         b = fp.read()
         print(b)
         c = yaml.load(b)
@@ -88,12 +94,8 @@ def test_class_yaml():
     assert _defaults is not None
 
 
-def test_joint_indexer():
+def test_joint_indexer(test_workspace):
     b = BaseExecutor.load_config(os.path.join(cur_dir, 'yaml/test-joint.yml'))
-    print(b[0].name)
-    print(type(b[0]))
-    print(b._drivers['SearchRequest'][0]._executor_name)
-    print(b._drivers['SearchRequest'])
     b.attach(pea=None)
     assert b._drivers['SearchRequest'][0]._exec == b[0]
     assert b._drivers['SearchRequest'][-1]._exec == b[1]

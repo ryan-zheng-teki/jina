@@ -10,23 +10,24 @@ import threading
 import time
 from collections import OrderedDict, defaultdict
 from contextlib import ExitStack
-from typing import Optional, Union, Tuple, List, Set, Dict, Iterator, Callable, Type, TextIO, Any
+from typing import Optional, Union, Tuple, List, Set, Dict, Iterator, Callable, TextIO, Any
 from urllib.request import Request, urlopen
 
 import ruamel.yaml
 from ruamel.yaml import StringIO
 
-from .builder import build_required, _build_flow, _optimize_flow
+from .builder import build_required, _build_flow, _optimize_flow, _hanging_pods
 from .. import JINA_GLOBAL
+from ..clients.python import InputFnType
 from ..enums import FlowBuildLevel, PodRoleType, FlowInspectType
 from ..excepts import FlowTopologyError, FlowMissingPodError
-from ..helper import yaml, expand_env_var, get_non_defaults_args, deprecated_alias, complete_path
+from ..helper import yaml, expand_env_var, get_non_defaults_args, deprecated_alias, complete_path, colored, \
+    get_public_ip, get_internal_ip, typename
 from ..logging import JinaLogger
 from ..logging.sse import start_sse_logger
 from ..peapods.pod import FlowPod, GatewayFlowPod
 
 if False:
-    from ..proto import jina_pb2
     import argparse
     import numpy as np
 
@@ -53,15 +54,15 @@ class Flow(ExitStack):
 
         """
         super().__init__()
-        if isinstance(args, argparse.Namespace):
-            self.logger = JinaLogger(self.__class__.__name__, **vars(args))
-        else:
-            self.logger = JinaLogger(self.__class__.__name__)
         self._pod_nodes = OrderedDict()  # type: Dict[str, 'FlowPod']
         self._inspect_pods = {}  # type: Dict[str, str]
         self._build_level = FlowBuildLevel.EMPTY
         self._last_changed_pod = ['gateway']  #: default first pod is gateway, will add when build()
         self._update_args(args, **kwargs)
+        if isinstance(self.args, argparse.Namespace):
+            self.logger = JinaLogger(self.__class__.__name__, **vars(self.args))
+        else:
+            self.logger = JinaLogger(self.__class__.__name__)
 
     def _update_args(self, args, **kwargs):
         from ..parser import set_flow_parser
@@ -125,12 +126,10 @@ class Flow(ExitStack):
         if not f:
             f = tempfile.NamedTemporaryFile('w', delete=False, dir=os.environ.get('JINA_EXECUTOR_WORKDIR', None)).name
         yaml.register_class(Flow)
-        # yaml.sort_base_mapping_type_on_output = False
-        # yaml.representer.add_representer(OrderedDict, yaml.Representer.represent_dict)
 
         with open(f, 'w', encoding='utf8') as fp:
             yaml.dump(self, fp)
-        self.logger.info(f'{self}\'s yaml config is save to %s' % f)
+        self.logger.info(f'{self}\'s yaml config is save to {f}')
         return True
 
     @property
@@ -140,8 +139,8 @@ class Flow(ExitStack):
         yaml.dump(self, stream)
         return stream.getvalue().strip()
 
-    @classmethod
-    def load_config(cls: Type['Flow'], filename: Union[str, TextIO]) -> 'Flow':
+    @staticmethod
+    def load_config(filename: Union[str, TextIO]) -> 'Flow':
         """Build an executor from a YAML file.
 
         :param filename: the file path of the YAML file or a ``TextIO`` stream to be loaded from
@@ -241,18 +240,30 @@ class Flow(ExitStack):
         self._pod_nodes[pod_name] = GatewayFlowPod(kwargs, needs)
 
     def needs(self, needs: Union[Tuple[str], List[str]],
-              uses: str = '_merge', name: str = 'joiner', *args, **kwargs) -> 'Flow':
+              name: str = 'joiner', *args, **kwargs) -> 'Flow':
         """
         Add a blocker to the flow, wait until all peas defined in **needs** completed.
 
         :param needs: list of service names to wait
-        :param uses: the config of the executor, by default is ``_merge``
         :param name: the name of this joiner, by default is ``joiner``
         :return: the modified flow
         """
         if len(needs) <= 1:
             raise FlowTopologyError('no need to wait for a single service, need len(needs) > 1')
-        return self.add(name=name, uses=uses, needs=needs, pod_role=PodRoleType.JOIN, *args, **kwargs)
+        return self.add(name=name, needs=needs, pod_role=PodRoleType.JOIN, *args, **kwargs)
+
+    def needs_all(self, name: str = 'joiner', *args, **kwargs) -> 'Flow':
+        """
+        Collect all hanging Pod so far and add a blocker to the flow, wait until all handing peas completed.
+        :param copy_flow: when set to true, then always copy the current flow and do the modification on top of it then return, otherwise, do in-line modification
+        :param name: the name of this joiner, by default is ``joiner``
+        :return: the modified flow
+        """
+        needs = _hanging_pods(self)
+        if len(needs) == 1:
+            return self.add(name=name, needs=needs, *args, **kwargs)
+
+        return self.needs(name=name, needs=needs, *args, **kwargs)
 
     def add(self,
             needs: Union[str, Tuple[str], List[str]] = None,
@@ -298,13 +309,15 @@ class Flow(ExitStack):
                 kwargs[key] = value
 
         kwargs['name'] = pod_name
+        kwargs['log-id'] = self.args.log_id
+        kwargs['num_part'] = len(needs)
 
         op_flow._pod_nodes[pod_name] = self._invoke_flowpod(kwargs, needs, pod_role)
         op_flow.last_pod = pod_name
 
         return op_flow
 
-    def _invoke_flowpod(self, kwargs, needs, pod_role):
+    def _invoke_flowpod(self, kwargs: Dict, needs: Set[str], pod_role: 'PodRoleType'):
         """This gets inherited in jinad"""
         return FlowPod(kwargs=kwargs, needs=needs, pod_role=pod_role)
 
@@ -339,7 +352,7 @@ class Flow(ExitStack):
         # now remove uses and add an auxiliary Pod
         if 'uses' in kwargs:
             kwargs.pop('uses')
-        op_flow = op_flow.add(name=f'_aux_{name}', uses='_pass', needs=_last_pod,
+        op_flow = op_flow.add(name=f'_aux_{name}', needs=_last_pod,
                               pod_role=PodRoleType.INSPECT_AUX_PASS, *args, **kwargs)
 
         # register any future connection to _last_pod by the auxiliary pod
@@ -358,7 +371,7 @@ class Flow(ExitStack):
             in general you don't need to manually call :meth:`gather_inspect`.
 
         :param name: the name of the gather pod
-        :param uses: the config of the executor, by default is ``_merge``
+        :param uses: the config of the executor, by default is ``_pass``
         :param include_last_pod: if to include the last modified pod in the flow
         :param args:
         :param kwargs:
@@ -441,6 +454,10 @@ class Flow(ExitStack):
 
         op_flow = _build_flow(op_flow, _outgoing_map)
         op_flow = _optimize_flow(op_flow, _outgoing_map, _pod_edges)
+        hanging_pods = _hanging_pods(op_flow)
+        if hanging_pods:
+            self.logger.warning(f'{hanging_pods} are hanging in this flow with no pod receiving from them, '
+                                f'you may want to double check if it is intentional or some mistake')
         op_flow._build_level = FlowBuildLevel.GRAPH
         return op_flow
 
@@ -471,15 +488,21 @@ class Flow(ExitStack):
         try:
             import urllib.request
             import flask, flask_cors
-            self._sse_logger = threading.Thread(name='sentinel-sse-logger',
-                                                target=start_sse_logger, daemon=True,
-                                                args=(self.args.logserver_config,
-                                                      self.yaml_spec))
-            self._sse_logger.start()
-            time.sleep(1)
-            response = urllib.request.urlopen(JINA_GLOBAL.logserver.ready, timeout=5)
-            if response.status == 200:
-                self.logger.success(f'logserver is started and available at {JINA_GLOBAL.logserver.address}')
+            try:
+                with open(self.args.logserver_config) as fp:
+                    log_config = yaml.load(fp)
+                self._sse_logger = threading.Thread(name='sentinel-sse-logger',
+                                                    target=start_sse_logger, daemon=True,
+                                                    args=(log_config,
+                                                          self.args.log_id,
+                                                          self.yaml_spec))
+                self._sse_logger.start()
+                time.sleep(1)
+                response = urllib.request.urlopen(JINA_GLOBAL.logserver.ready, timeout=5)
+                if response.status == 200:
+                    self.logger.success(f'logserver is started and available at {JINA_GLOBAL.logserver.address}')
+            except Exception as ex:
+                self.logger.error(f'Could not start logserver because of {repr(ex)}')
         except ModuleNotFoundError:
             self.logger.error(
                 f'sse logserver can not start because of "flask" and "flask_cors" are missing, '
@@ -507,7 +530,8 @@ class Flow(ExitStack):
             self.enter_context(v)
 
         self.logger.info(f'{self.num_pods} Pods (i.e. {self.num_peas} Peas) are running in this Flow')
-        self.logger.success(f'flow is now ready for use, current build_level is {self._build_level}')
+
+        self._show_success_message()
 
         return self
 
@@ -552,8 +576,8 @@ class Flow(ExitStack):
         return py_client(**kwargs)
 
     @deprecated_alias(buffer='input_fn', callback='output_fn')
-    def train(self, input_fn: Union[Iterator['jina_pb2.Document'], Iterator[bytes], Callable] = None,
-              output_fn: Callable[['jina_pb2.Request'], None] = None,
+    def train(self, input_fn: InputFnType = None,
+              output_fn: Callable[['Request'], None] = None,
               **kwargs):
         """Do training on the current flow
 
@@ -592,7 +616,7 @@ class Flow(ExitStack):
         self._get_client(**kwargs).train(input_fn, output_fn, **kwargs)
 
     def index_ndarray(self, array: 'np.ndarray', axis: int = 0, size: int = None, shuffle: bool = False,
-                      output_fn: Callable[['jina_pb2.Request'], None] = None,
+                      output_fn: Callable[['Request'], None] = None,
                       **kwargs):
         """Using numpy ndarray as the index source for the current flow
 
@@ -604,10 +628,11 @@ class Flow(ExitStack):
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_numpy
-        self._get_client(**kwargs).index(input_numpy(array, axis, size, shuffle), output_fn, **kwargs)
+        self._get_client(**kwargs).index(input_numpy(array, axis, size, shuffle),
+                                         output_fn, **kwargs)
 
     def search_ndarray(self, array: 'np.ndarray', axis: int = 0, size: int = None, shuffle: bool = False,
-                       output_fn: Callable[['jina_pb2.Request'], None] = None,
+                       output_fn: Callable[['Request'], None] = None,
                        **kwargs):
         """Use a numpy ndarray as the query source for searching on the current flow
 
@@ -619,11 +644,12 @@ class Flow(ExitStack):
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_numpy
-        self._get_client(**kwargs).search(input_numpy(array, axis, size, shuffle), output_fn, **kwargs)
+        self._get_client(**kwargs).search(input_numpy(array, axis, size, shuffle),
+                                          output_fn, **kwargs)
 
     def index_lines(self, lines: Iterator[str] = None, filepath: str = None, size: int = None,
                     sampling_rate: float = None, read_mode='r',
-                    output_fn: Callable[['jina_pb2.Request'], None] = None,
+                    output_fn: Callable[['Request'], None] = None,
                     **kwargs):
         """ Use a list of lines as the index source for indexing on the current flow
 
@@ -637,12 +663,13 @@ class Flow(ExitStack):
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_lines
-        self._get_client(**kwargs).index(input_lines(lines, filepath, size, sampling_rate, read_mode), output_fn,
+        self._get_client(**kwargs).index(input_lines(lines, filepath, size, sampling_rate, read_mode),
+                                         output_fn,
                                          **kwargs)
 
     def index_files(self, patterns: Union[str, List[str]], recursive: bool = True,
                     size: int = None, sampling_rate: float = None, read_mode: str = None,
-                    output_fn: Callable[['jina_pb2.Request'], None] = None,
+                    output_fn: Callable[['Request'], None] = None,
                     **kwargs):
         """ Use a set of files as the index source for indexing on the current flow
 
@@ -657,12 +684,13 @@ class Flow(ExitStack):
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_files
-        self._get_client(**kwargs).index(input_files(patterns, recursive, size, sampling_rate, read_mode), output_fn,
+        self._get_client(**kwargs).index(input_files(patterns, recursive, size, sampling_rate, read_mode),
+                                         output_fn,
                                          **kwargs)
 
     def search_files(self, patterns: Union[str, List[str]], recursive: bool = True,
                      size: int = None, sampling_rate: float = None, read_mode: str = None,
-                     output_fn: Callable[['jina_pb2.Request'], None] = None,
+                     output_fn: Callable[['Request'], None] = None,
                      **kwargs):
         """ Use a set of files as the query source for searching on the current flow
 
@@ -677,12 +705,13 @@ class Flow(ExitStack):
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_files
-        self._get_client(**kwargs).search(input_files(patterns, recursive, size, sampling_rate, read_mode), output_fn,
+        self._get_client(**kwargs).search(input_files(patterns, recursive, size, sampling_rate, read_mode),
+                                          output_fn,
                                           **kwargs)
 
     def search_lines(self, filepath: str = None, lines: Iterator[str] = None, size: int = None,
                      sampling_rate: float = None, read_mode='r',
-                     output_fn: Callable[['jina_pb2.Request'], None] = None,
+                     output_fn: Callable[['Request'], None] = None,
                      **kwargs):
         """ Use a list of files as the query source for searching on the current flow
 
@@ -696,12 +725,13 @@ class Flow(ExitStack):
         :param kwargs: accepts all keyword arguments of `jina client` CLI
         """
         from ..clients.python.io import input_lines
-        self._get_client(**kwargs).search(input_lines(lines, filepath, size, sampling_rate, read_mode), output_fn,
+        self._get_client(**kwargs).search(input_lines(lines, filepath, size, sampling_rate, read_mode),
+                                          output_fn,
                                           **kwargs)
 
     @deprecated_alias(buffer='input_fn', callback='output_fn')
-    def index(self, input_fn: Union[Iterator[Union['jina_pb2.Document', bytes]], Callable] = None,
-              output_fn: Callable[['jina_pb2.Request'], None] = None,
+    def index(self, input_fn: InputFnType = None,
+              output_fn: Callable[['Request'], None] = None,
               **kwargs):
         """Do indexing on the current flow
 
@@ -740,8 +770,8 @@ class Flow(ExitStack):
         self._get_client(**kwargs).index(input_fn, output_fn, **kwargs)
 
     @deprecated_alias(buffer='input_fn', callback='output_fn')
-    def search(self, input_fn: Union[Iterator[Union['jina_pb2.Document', bytes]], Callable] = None,
-               output_fn: Callable[['jina_pb2.Request'], None] = None,
+    def search(self, input_fn: InputFnType = None,
+               output_fn: Callable[['Request'], None] = None,
                **kwargs):
         """Do searching on the current flow
 
@@ -780,9 +810,73 @@ class Flow(ExitStack):
         """
         self._get_client(**kwargs).search(input_fn, output_fn, **kwargs)
 
+    @property
+    def _mermaid_str(self):
+        mermaid_graph = ["%%{init: {'theme': 'base', "
+                         "'themeVariables': { 'primaryColor': '#32C8CD', "
+                         "'edgeLabelBackground':'#fff', 'clusterBkg': '#FFCC66'}}}%%"]
+        mermaid_graph.append('graph LR')
+
+        start_repl = {}
+        end_repl = {}
+        for node, v in self._pod_nodes.items():
+            if not v.is_singleton and v.role != PodRoleType.GATEWAY:
+                mermaid_graph.append(f'subgraph sub_{node} ["{node} ({v._args.parallel})"]')
+                if v.is_head_router:
+                    head_router = node + '_HEAD'
+                    end_repl[node] = (head_router, '((fa:fa-random))')
+                if v.is_tail_router:
+                    tail_router = node + '_TAIL'
+                    start_repl[node] = (tail_router, '((fa:fa-random))')
+
+                p_r = '((%s))'
+                p_e = '[[%s]]'
+                for j in range(v._args.parallel):
+                    r = node + (f'_{j}' if v._args.parallel > 1 else '')
+                    if v.is_head_router:
+                        mermaid_graph.append(f'\t{head_router}{p_r % "head"}:::pea-->{r}{p_e % r}:::pea')
+                    if v.is_tail_router:
+                        mermaid_graph.append(f'\t{r}{p_e % r}:::pea-->{tail_router}{p_r % "tail"}:::pea')
+                mermaid_graph.append('end')
+
+        for node, v in self._pod_nodes.items():
+            ed_str = str(v.head_args.socket_in).split('_')[0]
+            for need in sorted(v.needs):
+                edge_str = ''
+                if need in self._pod_nodes:
+                    st_str = str(self._pod_nodes[need].tail_args.socket_out).split('_')[0]
+                    edge_str = f'|{st_str}-{ed_str}|'
+
+                _s = start_repl.get(need, (need, f'({need})'))
+                _e = end_repl.get(node, (node, f'({node})'))
+                _s_role = self._pod_nodes[need].role
+                _e_role = self._pod_nodes[node].role
+                line_st = '-->'
+
+                if _s_role in {PodRoleType.INSPECT, PodRoleType.JOIN_INSPECT}:
+                    _s = start_repl.get(need, (need, f'{{{{{need}}}}}'))
+
+                if _e_role == PodRoleType.GATEWAY:
+                    _e = ('gateway_END', f'({node})')
+                elif _e_role in {PodRoleType.INSPECT, PodRoleType.JOIN_INSPECT}:
+                    _e = end_repl.get(node, (node, f'{{{{{node}}}}}'))
+
+                if _s_role == PodRoleType.INSPECT or _e_role == PodRoleType.INSPECT:
+                    line_st = '-.->'
+
+                mermaid_graph.append(
+                    f'{_s[0]}{_s[1]}:::{str(_s_role)} {line_st} {edge_str}{_e[0]}{_e[1]}:::{str(_e_role)}')
+        mermaid_graph.append(f'classDef {str(PodRoleType.POD)} fill:#32C8CD,stroke:#009999')
+        mermaid_graph.append(f'classDef {str(PodRoleType.INSPECT)} fill:#ff6666,color:#fff')
+        mermaid_graph.append(f'classDef {str(PodRoleType.JOIN_INSPECT)} fill:#ff6666,color:#fff')
+        mermaid_graph.append(f'classDef {str(PodRoleType.GATEWAY)} fill:#6E7278,color:#fff')
+        mermaid_graph.append(f'classDef {str(PodRoleType.INSPECT_AUX_PASS)} fill:#fff,color:#000,stroke-dasharray: 5 5')
+        mermaid_graph.append('classDef pea fill:#009999,stroke:#1E6E73')
+        return '\n'.join(mermaid_graph)
+
     def plot(self, output: str = None,
              vertical_layout: bool = False,
-             inline_display: bool = True,
+             inline_display: bool = False,
              build: bool = True,
              copy_flow: bool = True) -> 'Flow':
         """
@@ -812,67 +906,10 @@ class Flow(ExitStack):
         op_flow = copy.deepcopy(self) if copy_flow else self
         if build:
             op_flow.build(False)
-        mermaid_graph = ["%%{init: {'theme': 'base', "
-                         "'themeVariables': { 'primaryColor': '#32C8CD', "
-                         "'edgeLabelBackground':'#fff', 'clusterBkg': '#FFCC66'}}}%%"]
-        mermaid_graph.append('graph TD' if vertical_layout else 'graph LR')
 
-        start_repl = {}
-        end_repl = {}
-        for node, v in op_flow._pod_nodes.items():
-            if not v.is_singleton and v.role != PodRoleType.GATEWAY:
-                mermaid_graph.append(f'subgraph sub_{node} ["{node} ({v._args.parallel})"]')
-                if v.is_head_router:
-                    head_router = node + '_HEAD'
-                    end_repl[node] = (head_router, '((fa:fa-random))')
-                if v.is_tail_router:
-                    tail_router = node + '_TAIL'
-                    start_repl[node] = (tail_router, '((fa:fa-random))')
-
-                p_r = '((%s))'
-                p_e = '[[%s]]'
-                for j in range(v._args.parallel):
-                    r = node + (f'_{j}' if v._args.parallel > 1 else '')
-                    if v.is_head_router:
-                        mermaid_graph.append('\t%s%s:::pea-->%s%s:::pea' % (head_router, p_r % 'head', r, p_e % r))
-                    if v.is_tail_router:
-                        mermaid_graph.append('\t%s%s:::pea-->%s%s:::pea' % (r, p_e % r, tail_router, p_r % 'tail'))
-                mermaid_graph.append('end')
-
-        for node, v in op_flow._pod_nodes.items():
-            ed_str = str(v.head_args.socket_in).split('_')[0]
-            for need in sorted(v.needs):
-                edge_str = ''
-                if need in op_flow._pod_nodes:
-                    st_str = str(op_flow._pod_nodes[need].tail_args.socket_out).split('_')[0]
-                    edge_str = f'|{st_str}-{ed_str}|'
-
-                _s = start_repl.get(need, (need, f'({need})'))
-                _e = end_repl.get(node, (node, f'({node})'))
-                _s_role = op_flow._pod_nodes[need].role
-                _e_role = op_flow._pod_nodes[node].role
-                line_st = '-->'
-
-                if _s_role in {PodRoleType.INSPECT, PodRoleType.JOIN_INSPECT}:
-                    _s = start_repl.get(need, (need, f'{{{{{need}}}}}'))
-
-                if _e_role == PodRoleType.GATEWAY:
-                    _e = ('gateway_END', f'({node})')
-                elif _e_role in {PodRoleType.INSPECT, PodRoleType.JOIN_INSPECT}:
-                    _e = end_repl.get(node, (node, f'{{{{{node}}}}}'))
-
-                if _s_role == PodRoleType.INSPECT or _e_role == PodRoleType.INSPECT:
-                    line_st = '-.->'
-
-                mermaid_graph.append(
-                    f'{_s[0]}{_s[1]}:::{str(_s_role)} {line_st} {edge_str}{_e[0]}{_e[1]}:::{str(_e_role)}')
-        mermaid_graph.append(f'classDef {str(PodRoleType.POD)} fill:#32C8CD,stroke:#009999')
-        mermaid_graph.append(f'classDef {str(PodRoleType.INSPECT)} fill:#ff6666,color:#fff')
-        mermaid_graph.append(f'classDef {str(PodRoleType.JOIN_INSPECT)} fill:#ff6666,color:#fff')
-        mermaid_graph.append(f'classDef {str(PodRoleType.GATEWAY)} fill:#6E7278,color:#fff')
-        mermaid_graph.append(f'classDef {str(PodRoleType.INSPECT_AUX_PASS)} fill:#fff,color:#000,stroke-dasharray: 5 5')
-        mermaid_graph.append('classDef pea fill:#009999,stroke:#1E6E73')
-        mermaid_str = '\n'.join(mermaid_graph)
+        mermaid_str = op_flow._mermaid_str
+        if vertical_layout:
+            mermaid_str = mermaid_str.replace('graph LR', 'graph TD')
 
         image_type = 'svg'
         if output and output.endswith('jpg'):
@@ -883,7 +920,6 @@ class Flow(ExitStack):
         if inline_display:
             try:
                 from IPython.display import display, Image
-                from IPython.utils import io
 
                 display(Image(url=url))
                 showed = True
@@ -897,6 +933,10 @@ class Flow(ExitStack):
             op_flow.logger.info(f'flow visualization: {url}')
 
         return self
+
+    def _ipython_display_(self):
+        """Displays the object in IPython as a side effect"""
+        self.plot(inline_display=True)
 
     def _mermaid_to_url(self, mermaid_str, img_type) -> str:
         """
@@ -951,22 +991,54 @@ class Flow(ExitStack):
 
     @property
     @build_required(FlowBuildLevel.GRAPH)
-    def port_expose(self):
+    def port_expose(self) -> int:
+        """Return the exposed port of the gateway"""
         return self._pod_nodes['gateway'].port_expose
 
     @property
     @build_required(FlowBuildLevel.GRAPH)
-    def host(self):
+    def host(self) -> str:
+        """Return the local address of the gateway """
         return self._pod_nodes['gateway'].host
 
+    @property
+    @build_required(FlowBuildLevel.GRAPH)
+    def address_private(self) -> str:
+        """Return the private IP address of the gateway for connecting from other machine in the same network """
+        return get_internal_ip()
+
+    @property
+    @build_required(FlowBuildLevel.GRAPH)
+    def address_public(self) -> str:
+        """Return the public IP address of the gateway for connecting from other machine in the public network """
+        return get_public_ip()
+
     def __iter__(self):
-        return self._pod_nodes.values().__iter__()
+        return self._pod_nodes.items().__iter__()
+
+    def _show_success_message(self):
+        if self._pod_nodes['gateway']._args.rest_api:
+            header = 'http://'
+            protocol = 'REST'
+        else:
+            header = 'tcp://'
+            protocol = 'gRPC'
+
+        address_table = [f'\t🖥️ Local access:\t' + colored(f'{header}{self.host}:{self.port_expose}',
+                                                            'cyan', attrs='underline'),
+                         f'\t🔒 Private network:\t' + colored(f'{header}{self.address_private}:{self.port_expose}',
+                                                              'cyan', attrs='underline')]
+        if self.address_public:
+            address_table.append(
+                f'\t🌐 Public address:\t' + colored(f'{header}{self.address_public}:{self.port_expose}',
+                                                    'cyan', attrs='underline'))
+        self.logger.success(f'🎉 Flow is ready to use, accepting {colored(protocol + " request", attrs="bold")}')
+        self.logger.info('\n' + '\n'.join(address_table))
 
     def block(self):
         """Block the process until user hits KeyboardInterrupt """
         try:
-            self.logger.success(f'flow is started at {self.host}:{self.port_expose}, '
-                                f'you can now use client to send request!')
+            self._show_success_message()
             threading.Event().wait()
         except KeyboardInterrupt:
             pass
@@ -978,6 +1050,14 @@ class Flow(ExitStack):
     def use_rest_gateway(self):
         """Change to use REST gateway for IO """
         self._common_kwargs['rest_api'] = True
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            return self._pod_nodes[item]
+        elif isinstance(item, int):
+            return list(self._pod_nodes.values())[item]
+        else:
+            raise TypeError(f'{typename(item)} is not supported')
 
     # for backward support
     join = needs

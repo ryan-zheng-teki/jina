@@ -3,14 +3,18 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from cli import _is_latest_version
-from jina.clients.python import PyClient, pprint_routes
+from jina import NdArray, Request
+from jina.clients.python import PyClient, pprint_routes, safe_callback
 from jina.drivers.querylang.queryset.dunderkey import dunder_get
-from jina.helper import cached_property
+from jina.excepts import BadClientCallback
+from jina.helper import cached_property, convert_tuple_to_list, complete_path
+from jina.logging import default_logger
 from jina.logging.profile import TimeContext
 from jina.proto import jina_pb2
-from jina.proto.uid import *
+from jina.types.document.uid import *
 from tests import random_docs
 
 
@@ -76,11 +80,6 @@ def test_hash():
     assert tmp.dtype == np.int64
 
 
-def test_random_docs():
-    ds = random_docs(100)
-    PyClient.check_input(ds)
-
-
 def test_dunder_get():
     a = SimpleNamespace()
     a.b = {'c': 1}
@@ -131,18 +130,20 @@ def test_wrap_func():
 
 def test_pprint_routes(capfd):
     result = []
-    r = jina_pb2.Route()
-    r.status.code = jina_pb2.Status.ERROR
+    r = jina_pb2.RouteProto()
+    r.status.code = jina_pb2.StatusProto.ERROR
     r.status.exception.stacks.extend(['r1\nline1', 'r2\nline2'])
     result.append(r)
-    r = jina_pb2.Route()
-    r.status.code = jina_pb2.Status.ERROR_CHAINED
+    r = jina_pb2.RouteProto()
+    r.status.code = jina_pb2.StatusProto.ERROR_CHAINED
     r.status.exception.stacks.extend(['line1', 'line2'])
     result.append(r)
-    r = jina_pb2.Route()
-    r.status.code = jina_pb2.Status.SUCCESS
+    r = jina_pb2.RouteProto()
+    r.status.code = jina_pb2.StatusProto.SUCCESS
     result.append(r)
-    pprint_routes(result)
+    rr = Request()
+    rr.routes.extend(result)
+    pprint_routes(rr)
     out, err = capfd.readouterr()
     assert out == '''+-----+------+------------+
 | \x1b[1mPod\x1b[0m | \x1b[1mTime\x1b[0m | \x1b[1mException\x1b[0m  |
@@ -156,3 +157,47 @@ def test_pprint_routes(capfd):
 | 🟢  | 0ms  |            |
 +-----+------+------------+
 '''
+
+
+def test_convert_tuple_to_list():
+    d = {'1': (1, 2), 2: {'a': (3, 4)}}
+    convert_tuple_to_list(d)
+    assert d == {'1': [1, 2], 2: {'a': [3, 4]}}
+
+
+def test_safe_callback():
+    def t1():
+        raise NotImplementedError
+
+    st1 = safe_callback(t1, continue_on_error=True, logger=default_logger)
+    st1()
+
+    st1 = safe_callback(t1, continue_on_error=False, logger=default_logger)
+    with pytest.raises(BadClientCallback):
+        st1()
+
+
+def test_random_docs():
+    np.random.seed(42)
+    docs1 = list(random_docs(10))
+    np.random.seed(42)
+    docs2 = list(random_docs(10))
+    for d2, d1 in zip(docs2, docs1):
+        np.testing.assert_almost_equal(d2.embedding, NdArray(d1.embedding).value)
+        assert d2.text == d1.text
+        assert d2.tags['id'] == d1.tags['id']
+        for c2, c1 in zip(d2.chunks, d1.chunks):
+            np.testing.assert_almost_equal(c2.embedding, NdArray(c1.embedding).value)
+            assert c2.text == c1.text
+            assert c2.tags['id'] == c1.tags['id']
+
+
+def test_complete_path_success():
+    assert complete_path('test_helper.py')
+    assert complete_path('helper.py')
+    assert complete_path('bash')
+
+
+def test_complete_path_not_found():
+    with pytest.raises(FileNotFoundError):
+        assert complete_path('unknown.yaml')

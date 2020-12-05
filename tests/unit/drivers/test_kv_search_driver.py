@@ -2,10 +2,12 @@ from typing import Optional
 
 import numpy as np
 
+from jina import Document
 from jina.drivers.search import KVSearchDriver
 from jina.executors.indexers import BaseKVIndexer
 from jina.proto import jina_pb2
-from jina.proto.ndarray.generic import GenericNdArray
+from jina.types.document.uid import id2hash
+from jina.types.ndarray.generic import NdArray
 
 
 class MockIndexer(BaseKVIndexer):
@@ -13,7 +15,7 @@ class MockIndexer(BaseKVIndexer):
     def add(self, keys: 'np.ndarray', vectors: 'np.ndarray', *args, **kwargs):
         pass
 
-    def query(self, key: int) -> Optional['jina_pb2.Document']:
+    def query(self, key: int) -> Optional['jina_pb2.DocumentProto']:
         if key in self.db.keys():
             return self.db[key]
         else:
@@ -30,23 +32,23 @@ class MockIndexer(BaseKVIndexer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        doc1 = jina_pb2.Document()
-        doc1.id = '1'
-        GenericNdArray(doc1.embedding).value = np.array([int(doc1.id)])
-        doc2 = jina_pb2.Document()
-        doc2.id = '2'
-        GenericNdArray(doc2.embedding).value = np.array([int(doc2.id)])
-        doc3 = jina_pb2.Document()
-        doc3.id = '3'
-        GenericNdArray(doc3.embedding).value = np.array([int(doc3.id)])
-        doc4 = jina_pb2.Document()
-        doc4.id = '4'
-        GenericNdArray(doc4.embedding).value = np.array([int(doc4.id)])
+        doc1 = Document()
+        doc1.id = str(1) * 16
+        doc1.embedding = np.array([int(doc1.id)])
+        doc2 = Document()
+        doc2.id = str(2) * 16
+        doc2.embedding = np.array([int(doc2.id)])
+        doc3 = Document()
+        doc3.id = str(3) * 16
+        doc3.embedding = np.array([int(doc3.id)])
+        doc4 = Document()
+        doc4.id = str(4) * 16
+        doc4.embedding = np.array([int(doc4.id)])
         self.db = {
-            1: doc1.SerializeToString(),
-            2: doc2.SerializeToString(),
-            3: doc3.SerializeToString(),
-            4: doc4.SerializeToString()
+            id2hash(doc1.id): doc1.SerializeToString(),
+            id2hash(doc2.id): doc2.SerializeToString(),
+            id2hash(doc3.id): doc3.SerializeToString(),
+            id2hash(doc4.id): doc4.SerializeToString()
         }
 
 
@@ -71,13 +73,11 @@ def create_document_to_search():
     #   - chunk: 3
     #   - chunk: 4
     #   - chunk: 5 - will be missing from KV indexer
-    doc = jina_pb2.Document()
-    doc.granularity = 0
-    doc.id = '0'
+    doc = Document()
+    doc.id = '0' * 16
     for c in range(5):
-        chunk = doc.chunks.add()
-        chunk.granularity = doc.granularity + 1
-        chunk.id = str(c + 1)
+        chunk = doc.chunks.new()
+        chunk.id = str(c + 1) * 16
     return doc
 
 
@@ -90,15 +90,14 @@ def create_document_to_search_with_matches_on_chunks():
     #     - match: 4
     #     - match: 5 - will be missing from KV indexer
     #     - match: 6 - will be missing from KV indexer
-    doc = jina_pb2.Document()
-    doc.id = '0'
-    doc.granularity = 0
-    chunk = doc.chunks.add()
-    chunk.id = '1'
-    chunk.granularity = doc.granularity + 1
+    doc = Document()
+    doc.id = '0' * 16
+    chunk = doc.chunks.new()
+    chunk.id = '1' * 16
     for m in range(5):
-        match = chunk.matches.add()
-        match.id = str(m + 2)
+        d = Document(id=str(m + 2) * 16)
+        d.score.value = 1.
+        chunk.matches.append(d)
     return doc
 
 
@@ -109,17 +108,20 @@ def test_vectorsearch_driver_mock_indexer_apply_all():
     executor = MockIndexer()
     driver.attach(executor=executor, pea=None)
 
-    assert len(doc.chunks) == 5
-    for chunk in doc.chunks:
-        assert GenericNdArray(chunk.embedding).value is None
+    dcs = list(doc.chunks)
+    assert len(dcs) == 5
+    for chunk in dcs:
+        assert chunk.embedding is None
 
     driver._apply_all(doc.chunks)
 
+    dcs = list(doc.chunks)
+
     # chunk idx: 5 had no matched and is removed as missing idx
-    assert len(doc.chunks) == 4
-    for chunk in doc.chunks:
-        assert GenericNdArray(chunk.embedding).value is not None
-        embedding_array = GenericNdArray(chunk.embedding).value
+    assert len(dcs) == 4
+    for chunk in dcs:
+        assert chunk.embedding is not None
+        embedding_array = chunk.embedding
         np.testing.assert_equal(embedding_array, np.array([int(chunk.id)]))
 
 
@@ -130,17 +132,19 @@ def test_vectorsearch_driver_mock_indexer_traverse_apply():
     executor = MockIndexer()
     driver.attach(executor=executor, pea=None)
 
-    assert len(doc.chunks) == 5
-    for chunk in doc.chunks:
-        assert GenericNdArray(chunk.embedding).value is None
+    dcs = list(doc.chunks)
+    assert len(dcs) == 5
+    for chunk in dcs:
+        assert chunk.embedding is None
 
     driver._traverse_apply(doc.chunks)
 
     # chunk idx: 5 had no matched and is removed as missing idx
-    assert len(doc.chunks) == 4
-    for chunk in doc.chunks:
-        assert GenericNdArray(chunk.embedding).value is not None
-        embedding_array = GenericNdArray(chunk.embedding).value
+    dcs = list(doc.chunks)
+    assert len(dcs) == 4
+    for chunk in dcs:
+        assert chunk.embedding is not None
+        embedding_array = chunk.embedding
         np.testing.assert_equal(embedding_array, np.array([int(chunk.id)]))
 
 
@@ -152,10 +156,12 @@ def test_vectorsearch_driver_mock_indexer_with_matches_on_chunks():
 
     driver._traverse_apply([doc])
 
-    assert len(doc.chunks) == 1
-    chunk = doc.chunks[0]
-    assert len(chunk.matches) == 3
-    for match in chunk.matches:
-        assert GenericNdArray(match.embedding).value is not None
-        embedding_array = GenericNdArray(match.embedding).value
+    dcs = list(doc.chunks)
+    assert len(dcs) == 1
+    chunk = dcs[0]
+    matches = list(chunk.matches)
+    assert len(matches) == 3
+    for match in matches:
+        assert NdArray(match.embedding).value is not None
+        embedding_array = NdArray(match.embedding).value
         np.testing.assert_equal(embedding_array, np.array([int(match.id)]))

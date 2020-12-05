@@ -3,9 +3,11 @@ import os
 import numpy as np
 import pytest
 
+from jina import QueryLang
+from jina.drivers.search import VectorSearchDriver
 from jina.flow import Flow
 from jina.proto import jina_pb2
-from jina.proto.ndarray.generic import GenericNdArray
+from jina.types.ndarray.generic import NdArray
 
 
 @pytest.fixture
@@ -18,10 +20,10 @@ def config(tmpdir):
 
 def random_docs(num_docs, embed_dim=10, jitter=1):
     for j in range(num_docs):
-        d = jina_pb2.Document()
+        d = jina_pb2.DocumentProto()
         d.tags['id'] = j
         d.text = b'hello'
-        GenericNdArray(d.embedding).value = np.random.random([embed_dim + np.random.randint(0, jitter)])
+        NdArray(d.embedding).value = np.random.random([embed_dim + np.random.randint(0, jitter)])
         yield d
 
 
@@ -32,9 +34,9 @@ def validate_results(resp):
 
 
 def test_topk(config):
-    with Flow().load_config('flow.yml') as index_flow:
+    with Flow.load_config('flow.yml') as index_flow:
         index_flow.index(input_fn=random_docs(100))
-    with Flow().load_config('flow.yml') as search_flow:
+    with Flow.load_config('flow.yml') as search_flow:
         search_flow.search(input_fn=random_docs(int(os.environ['JINA_NDOCS'])),
                            output_fn=validate_results)
 
@@ -47,13 +49,10 @@ def validate_override_results(resp):
 
 def test_topk_override(config):
     # Making queryset
-    top_k_queryset = jina_pb2.QueryLang()
-    top_k_queryset.name = 'VectorSearchDriver'
-    top_k_queryset.priority = 1
-    top_k_queryset.parameters['top_k'] = os.environ['JINA_TOPK_OVERRIDE']
+    top_k_queryset = QueryLang(VectorSearchDriver(top_k=int(os.environ['JINA_TOPK_OVERRIDE']), priority=1))
 
-    with Flow().load_config('flow.yml') as index_flow:
+    with Flow.load_config('flow.yml') as index_flow:
         index_flow.index(input_fn=random_docs(100))
-    with Flow().load_config('flow.yml') as search_flow:
+    with Flow.load_config('flow.yml') as search_flow:
         search_flow.search(input_fn=random_docs(int(os.environ['JINA_NDOCS'])),
                            output_fn=validate_override_results, queryset=[top_k_queryset])

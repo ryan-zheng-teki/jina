@@ -3,7 +3,8 @@ from google.protobuf.struct_pb2 import ListValue
 
 from jina.drivers.predict import BinaryPredictDriver, MultiLabelPredictDriver, OneHotPredictDriver, \
     Prediction2DocBlobDriver
-from jina.proto.ndarray.generic import GenericNdArray
+from jina.types.ndarray.generic import NdArray
+from jina.types.sets import DocumentSet
 from tests import random_docs
 
 
@@ -34,7 +35,7 @@ class MockPrediction2DocBlobDriver(Prediction2DocBlobDriver):
 
 
 def test_binary_predict_driver():
-    docs = list(random_docs(2))
+    docs = DocumentSet(random_docs(2))
     driver = MockBinaryPredictDriver()
     driver._traverse_apply(docs)
 
@@ -45,7 +46,7 @@ def test_binary_predict_driver():
 
 
 def test_one_hot_predict_driver():
-    docs = list(random_docs(2))
+    docs = DocumentSet(random_docs(2))
     driver = MockOneHotPredictDriver(labels=['cat', 'dog', 'human'])
     driver._traverse_apply(docs)
 
@@ -56,7 +57,7 @@ def test_one_hot_predict_driver():
 
 
 def test_multi_label_predict_driver():
-    docs = list(random_docs(2))
+    docs = DocumentSet(random_docs(2))
     driver = MockMultiLabelPredictDriver(labels=['cat', 'dog', 'human'])
     driver._traverse_apply(docs)
 
@@ -65,7 +66,7 @@ def test_multi_label_predict_driver():
         for t in d.tags['prediction']:
             assert t in {'cat', 'dog', 'human'}
 
-    docs = list(random_docs(2))
+    docs = DocumentSet(random_docs(2))
     driver = MockAllLabelPredictDriver(labels=['cat', 'dog', 'human'])
     driver._traverse_apply(docs)
 
@@ -75,9 +76,9 @@ def test_multi_label_predict_driver():
 
 
 def test_as_blob_driver():
-    docs = list(random_docs(2))
+    docs = DocumentSet(random_docs(2))
     driver = MockPrediction2DocBlobDriver()
     driver._traverse_apply(docs)
 
     for d in docs:
-        assert GenericNdArray(d.blob).value.shape == (3,)
+        assert NdArray(d.blob).value.shape == (3,)

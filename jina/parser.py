@@ -93,6 +93,7 @@ def set_hub_build_parser(parser=None):
         parser = set_base_parser()
 
     set_hub_base_parser(parser)
+    from .enums import BuildTestLevel
 
     parser.add_argument('path', type=str, help='path to the directory containing '
                                                'Dockerfile, manifest.yml, README.md '
@@ -110,7 +111,10 @@ def set_hub_build_parser(parser=None):
     parser.add_argument('--raise-error', action='store_true', default=False,
                         help='raise any error and exit with code 1')
     parser.add_argument('--test-uses', action='store_true', default=False,
-                        help='after the build, test the image in "uses" with Flow API')
+                        help='after the build, test the image in "uses" with different level')
+    parser.add_argument('--test-level', type=BuildTestLevel.from_string,
+                        choices=list(BuildTestLevel), default=BuildTestLevel.FLOW,
+                        help='the test level when "test-uses" is set, "NONE" means no test')
     parser.add_argument('--host-info', action='store_true', default=False,
                         help='store the host information during bookkeeping')
     parser.add_argument('--daemon', action='store_true', default=False,
@@ -202,6 +206,7 @@ def set_flow_parser(parser=None):
     if not parser:
         parser = set_base_parser()
     from .enums import FlowOutputType, FlowOptimizeLevel, FlowInspectType
+    from .helper import get_random_identity
 
     gp = add_arg_group(parser, 'flow arguments')
     gp.add_argument('--uses', type=str, help='a yaml file represents a flow')
@@ -212,9 +217,12 @@ def set_flow_parser(parser=None):
                     default=resource_filename('jina',
                                               '/'.join(('resources', 'logserver.default.yml'))),
                     help='the yaml config of the log server')
+    gp.add_argument('--log-id', type=str, default=get_random_identity(),
+                    help='the log id used to aggregate logs by fluentd' if _SHOW_ALL_ARGS else argparse.SUPPRESS)
     gp.add_argument('--optimize-level', type=FlowOptimizeLevel.from_string, default=FlowOptimizeLevel.NONE,
                     help='removing redundant routers from the flow. Note, this may change the gateway zmq socket to BIND \
-                            and hence not allow multiple clients connected to the gateway at the same time.')
+                            and hence not allow multiple clients connected to the gateway at the same time.'
+                    if _SHOW_ALL_ARGS else argparse.SUPPRESS)
     gp.add_argument('--output-type', type=FlowOutputType.from_string,
                     choices=list(FlowOutputType), default=FlowOutputType.SHELL_PROC,
                     help='type of the output')
@@ -238,12 +246,12 @@ def set_pea_parser(parser=None):
     gp0.add_argument('--name', type=str,
                      help='the name of this pea, used to identify the pod and its logs.')
     gp0.add_argument('--identity', type=str, default=get_random_identity(),
-                     help='the identity of the sockets, default a random string')
+                     help='the identity of the sockets, default a random string (Important for load balancing messages')
     gp0.add_argument('--uses', type=str, default='_pass',
                      help='the config of the executor, it could be '
                           '> a YAML file path, '
                           '> a supported executor\'s class name, '
-                          '> one of "_clear", "_route", "_pass", "_logforward", "_merge" '
+                          '> one of "_clear", "_pass", "_logforward" '
                           '> the content of YAML config (must starts with "!")'
                           '> a docker image')  # pod(no use) -> pea
     gp0.add_argument('--py-modules', type=str, nargs='*',
@@ -289,6 +297,9 @@ def set_pea_parser(parser=None):
                      help='timeout (ms) of the control request, -1 for waiting forever')
     gp2.add_argument('--timeout-ready', type=int, default=10000,
                      help='timeout (ms) of a pea is ready for request, -1 for waiting forever')
+    gp2.add_argument('--expose-public', action='store_true', default=False,
+                     help='expose the public IP address to remote when necessary, by default it exposes'
+                          'private IP address, which only allows accessing under the same network/subnet')
 
     gp3 = add_arg_group(parser, 'pea IO arguments')
     gp3.add_argument('--dump-interval', type=int, default=240,
@@ -308,7 +319,7 @@ def set_pea_parser(parser=None):
 
     gp5 = add_arg_group(parser, 'pea messaging arguments')
     gp5.add_argument('--num-part', type=int, default=0,
-                     help='the number of replicated message sent to the next Pod, 0 and 1 means single part'
+                     help='the number of messages expected from upstream, 0 and 1 means single part'
                      if _SHOW_ALL_ARGS else argparse.SUPPRESS)
     gp5.add_argument('--role', type=PeaRoleType.from_string, choices=list(PeaRoleType),
                      help='the role of this pea in a pod' if _SHOW_ALL_ARGS else argparse.SUPPRESS)
@@ -338,6 +349,8 @@ def set_pea_parser(parser=None):
     gp7.add_argument('--log-remote', action='store_true', default=False,
                      help='turn on remote logging, this should not be set manually'
                      if _SHOW_ALL_ARGS else argparse.SUPPRESS)
+    gp7.add_argument('--log-id', type=str, default=get_random_identity(),
+                     help='the log id used to aggregate logs by fluentd' if _SHOW_ALL_ARGS else argparse.SUPPRESS)
 
     gp8 = add_arg_group(parser, 'ssh tunneling arguments')
     gp8.add_argument('--ssh-server', type=str, default=None,
@@ -425,6 +438,7 @@ def _set_grpc_parser(parser=None):
         parser = set_base_parser()
     from .helper import random_port
     from . import __default_host__
+    from .enums import RemoteAccessType
     gp1 = add_arg_group(parser, 'grpc and remote arguments')
     gp1.add_argument('--host', type=str, default=__default_host__,
                      help=f'host address of the pea/gateway, by default it is {__default_host__}.')
@@ -438,6 +452,10 @@ def _set_grpc_parser(parser=None):
                      help='respect the http_proxy and https_proxy environment variables. '
                           'otherwise, it will unset these proxy variables before start. '
                           'gRPC seems to prefer no proxy')
+    gp1.add_argument('--remote-access', choices=list(RemoteAccessType),
+                     default=RemoteAccessType.JINAD,
+                     type=RemoteAccessType.from_string,
+                     help=f'host address of the pea/gateway, by default it is {__default_host__}.')
     return parser
 
 
@@ -482,8 +500,6 @@ def set_gateway_parser(parser=None):
                      help='the number of pre-fetched requests from the client')
     gp1.add_argument('--prefetch-on-recv', type=int, default=1,
                      help='the number of additional requests to fetch on every receive')
-    gp1.add_argument('--allow-spawn', action='store_true', default=False,
-                     help='accept the spawn requests sent from other remote Jina')
     gp1.add_argument('--rest-api', action='store_true', default=False,
                      help='use REST-API as the interface instead of gRPC with port number '
                           'set to the value of "port-expose"')
@@ -513,7 +529,7 @@ def set_client_cli_parser(parser=None):
     if not parser:
         parser = set_base_parser()
 
-    from .enums import ClientMode
+    from .enums import RequestType, CallbackOnType
 
     _set_grpc_parser(parser)
 
@@ -521,19 +537,22 @@ def set_client_cli_parser(parser=None):
 
     gp1.add_argument('--batch-size', type=int, default=100,
                      help='the number of documents in each request')
-    gp1.add_argument('--mode', choices=list(ClientMode), type=ClientMode.from_string,
+    gp1.add_argument('--mode', choices=list(RequestType), type=RequestType.from_string,
                      # required=True,
                      help='the mode of the client and the server')
     gp1.add_argument('--top-k', type=int,
                      help='top_k results returned in the search mode')
     gp1.add_argument('--mime-type', type=str,
                      help='MIME type of the input, useful when input-type is set to BUFFER')
-    gp1.add_argument('--callback-on-body', action='store_true', default=False,
-                     help='callback function works directly on the request body')
+    gp1.add_argument('--callback-on', choices=list(CallbackOnType), type=CallbackOnType.from_string,
+                     default=CallbackOnType.REQUEST,
+                     help='which field the output function should work with')
     gp1.add_argument('--timeout-ready', type=int, default=10000,
                      help='timeout (ms) of a pea is ready for request, -1 for waiting forever')
     gp1.add_argument('--skip-dry-run', action='store_true', default=False,
                      help='skip dry run (connectivity test) before sending every request')
+    gp1.add_argument('--continue-on-error', action='store_true', default=False,
+                     help='if to continue when callback function throws an error')
     return parser
 
 
@@ -681,10 +700,10 @@ class _ColoredHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
                 if isinstance(action, argparse._StoreTrueAction):
 
                     help += colored(' (default: %s)' % (
-                        'enabled' if action.default else 'disabled, use "--%s" to enable it' % action.dest),
+                        'enabled' if action.default else f'disabled, use "--{action.dest}" to enable it'),
                                     attrs=['dark'])
                 elif action.choices:
-                    choices_str = '{%s}' % ', '.join([str(c) for c in action.choices])
+                    choices_str = f'{{{", ".join([str(c) for c in action.choices])}}}'
                     help += colored(' (choose from: ' + choices_str + '; default: %(default)s)', attrs=['dark'])
                 elif action.option_strings or action.nargs in defaulting_nargs:
                     help += colored(' (type: %(type)s; default: %(default)s)', attrs=['dark'])
@@ -713,10 +732,10 @@ class _ColoredHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
 
             if len(action.choices) > 4:
                 choice_strs = ', '.join([str(c) for c in action.choices][:4])
-                result = '{%s ... %d more choices}' % (choice_strs, len(action.choices) - 4)
+                result = f'{{{choice_strs} ... {len(action.choices) - 4} more choices}}'
             else:
                 choice_strs = ', '.join([str(c) for c in action.choices])
-                result = '{%s}' % choice_strs
+                result = f'{{{choice_strs}}}'
         else:
             result = default_metavar
 

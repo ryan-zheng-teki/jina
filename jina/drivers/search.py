@@ -1,12 +1,13 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Iterable, Tuple
+from typing import Tuple
 
 from . import BaseExecutableDriver, QuerySetReader
-from .helper import extract_docs
-from ..proto import uid, jina_pb2
-from ..proto.ndarray.generic import GenericNdArray
+from ..types.document import Document
+
+if False:
+    from ..types.sets import DocumentSet
 
 
 class BaseSearchDriver(BaseExecutableDriver):
@@ -26,9 +27,6 @@ class BaseSearchDriver(BaseExecutableDriver):
             *args,
             **kwargs
         )
-
-        self.hash2id = uid.hash2id
-        self.id2hash = uid.id2hash
 
 
 class KVSearchDriver(BaseSearchDriver):
@@ -57,13 +55,12 @@ class KVSearchDriver(BaseSearchDriver):
         super().__init__(*args, **kwargs)
         self._is_merge = is_merge
 
-    def _apply_all(self, docs: Iterable['jina_pb2.Document'], *args, **kwargs) -> None:
+    def _apply_all(self, docs: 'DocumentSet', *args, **kwargs) -> None:
         miss_idx = []  #: missed hit results, some search may not end with results. especially in shards
         for idx, retrieved_doc in enumerate(docs):
-            serialized_doc = self.exec_fn(self.id2hash(retrieved_doc.id))
+            serialized_doc = self.exec_fn(hash(retrieved_doc.id))
             if serialized_doc:
-                r = jina_pb2.Document()
-                r.ParseFromString(serialized_doc)
+                r = Document(serialized_doc)
 
                 # TODO: this isn't perfect though, merge applies recursively on all children
                 #  it will duplicate embedding.shape if embedding is already there
@@ -85,10 +82,10 @@ class VectorFillDriver(QuerySetReader, BaseSearchDriver):
     def __init__(self, executor: str = None, method: str = 'query_by_id', *args, **kwargs):
         super().__init__(executor, method, *args, **kwargs)
 
-    def _apply_all(self, docs: Iterable['jina_pb2.Document'], *args, **kwargs) -> None:
-        embeds = self.exec_fn([self.id2hash(d.id) for d in docs])
+    def _apply_all(self, docs: 'DocumentSet', *args, **kwargs) -> None:
+        embeds = self.exec_fn([hash(d.id) for d in docs])
         for doc, embedding in zip(docs, embeds):
-            GenericNdArray(doc.embedding).value = embedding
+            doc.embedding = embedding
 
 
 class VectorSearchDriver(QuerySetReader, BaseSearchDriver):
@@ -109,8 +106,8 @@ class VectorSearchDriver(QuerySetReader, BaseSearchDriver):
         self._top_k = top_k
         self._fill_embedding = fill_embedding
 
-    def _apply_all(self, docs: Iterable['jina_pb2.Document'], *args, **kwargs) -> None:
-        embed_vecs, doc_pts, bad_doc_ids = extract_docs(docs, embedding=True)
+    def _apply_all(self, docs: 'DocumentSet', *args, **kwargs) -> None:
+        embed_vecs, doc_pts, bad_docs = docs.all_embeddings
 
         if not doc_pts:
             return
@@ -119,20 +116,17 @@ class VectorSearchDriver(QuerySetReader, BaseSearchDriver):
         if self._fill_embedding and not fill_fn:
             self.logger.warning(f'"fill_embedding=True" but {self.exec} does not have "query_by_id" method')
 
-        if bad_doc_ids:
-            self.logger.warning(f'these bad docs can not be added: {bad_doc_ids}')
+        if bad_docs:
+            self.logger.warning(f'these bad docs can not be added: {bad_docs}')
         idx, dist = self.exec_fn(embed_vecs, top_k=int(self.top_k))
         op_name = self.exec.__class__.__name__
         for doc, topks, scores in zip(doc_pts, idx, dist):
 
             topk_embed = fill_fn(topks) if (self._fill_embedding and fill_fn) else [None] * len(topks)
-
             for match_hash, score, vec in zip(topks, scores, topk_embed):
-                r = doc.matches.add()
-                r.id = self.hash2id(match_hash)
-                r.adjacency = doc.adjacency + 1
-                r.score.ref_id = doc.id
-                r.score.value = score
-                r.score.op_name = op_name
+                m = Document(id=int(match_hash))
+                m.score.value = score
+                m.score.op_name = op_name
+                r = doc.matches.append(m)
                 if vec is not None:
-                    GenericNdArray(r.embedding).value = vec
+                    r.embedding = vec

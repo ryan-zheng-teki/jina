@@ -11,15 +11,14 @@ from google.protobuf.json_format import MessageToJson
 from .grpc_asyncio import AsyncioExecutor
 from .pea import BasePea
 from .zmq import AsyncZmqlet
-from .. import __stop_msg__
-from ..enums import ClientMode
-from ..excepts import BadRequestType, GatewayPartialMessage
-from ..helper import use_uvloop
+from .. import __stop_msg__, Request
+from ..enums import RequestType
+from ..helper import use_uvloop, colored
+from ..importer import ImportExtensions
 from ..logging import JinaLogger
 from ..logging.profile import TimeContext
-from ..parser import set_pea_parser, set_pod_parser
 from ..proto import jina_pb2_grpc, jina_pb2
-from ..proto.message import ProtoMessage
+from jina.types.message import Message
 
 use_uvloop()
 
@@ -40,10 +39,10 @@ class GatewayPea:
             os.unsetenv('http_proxy')
             os.unsetenv('https_proxy')
 
-        os.environ['JINA_POD_NAME'] = 'gateway'
-        self.logger = JinaLogger(self.__class__.__name__, **vars(args))
-        if args.allow_spawn:
-            self.logger.critical('SECURITY ALERT! this gateway allows SpawnRequest from remote Jina')
+        self.logger = JinaLogger(context=self.__class__.__name__,
+                                 name='gateway',
+                                 log_id=args.log_id,
+                                 log_config=args.log_config)
         self._p_servicer = self._Pea(args)
         self._stop_event = threading.Event()
         self.is_ready = threading.Event()
@@ -75,7 +74,6 @@ class GatewayPea:
 
     def close(self):
         self._ae.shutdown()
-        self._p_servicer.close()
         self._server.stop(None)
         self._stop_event.set()
         self.logger.success(__stop_msg__)
@@ -94,23 +92,22 @@ class GatewayPea:
             self.args = args
             self.name = args.name or self.__class__.__name__
             self.logger = JinaLogger(self.name, **vars(args))
-            self.peapods = []
+            self.logger.info(
+                f'Gateway will connect with the following arguments: \n'
+                f'host_in: {colored(self.args.host_in, "yellow")}, port_in: {colored(self.args.port_in, "yellow")}, '
+                f'socket_in: {colored(self.args.socket_in, "yellow")} \n '
+                f'host_out: {colored(self.args.host_out, "yellow")}, port_out: {colored(self.args.port_out, "yellow")}, '
+                f'socket_out: {colored(self.args.socket_out, "yellow")} \n '
+                f'host: {colored(self.args.host, "yellow")}, control_port: {colored(self.args.port_ctrl, "yellow")}')
 
-        def handle(self, msg: 'ProtoMessage') -> 'jina_pb2.Request':
-            """ Note gRPC accepts :class:`jina_pb2.Request` only, so no more :class:`LazyRequest`.
-
-            :param msg:
-            :return:
-            """
+        def handle(self, msg: 'Message') -> 'Request':
             msg.add_route(self.name, self.args.identity)
-            if not msg.is_complete:
-                msg.add_exception(GatewayPartialMessage(f'gateway can not handle message with num_part={msg.envelope.num_part}'))
             return msg.response
 
         async def CallUnary(self, request, context):
             with AsyncZmqlet(self.args, logger=self.logger) as zmqlet:
-                await zmqlet.send_message(ProtoMessage(None, request, 'gateway',
-                                                       **vars(self.args)))
+                await zmqlet.send_message(Message(None, request, 'gateway',
+                                                  **vars(self.args)))
                 return await zmqlet.recv_message(callback=self.handle)
 
         async def Call(self, request_iterator, context):
@@ -125,8 +122,8 @@ class GatewayPea:
                         try:
                             asyncio.create_task(
                                 zmqlet.send_message(
-                                    ProtoMessage(None, next(request_iterator), 'gateway',
-                                                 **vars(self.args))))
+                                    Message(None, next(request_iterator), 'gateway',
+                                            **vars(self.args))))
                             fetch_to.append(asyncio.create_task(zmqlet.recv_message(callback=self.handle)))
                         except StopIteration:
                             return True
@@ -153,50 +150,6 @@ class GatewayPea:
                     prefetch_task.clear()
                     prefetch_task = [j for j in onrecv_task]
 
-        async def Spawn(self, request, context):
-            _req = getattr(request, request.WhichOneof('body'))
-            if self.args.allow_spawn:
-                from . import Pea, Pod
-                _req_type = type(_req)
-                if _req_type == jina_pb2.SpawnRequest.PeaSpawnRequest:
-                    _args = set_pea_parser().parse_known_args(_req.args)[0]
-                    self.logger.info('starting a BasePea from a remote request')
-                    # we do not allow remote spawn request to spawn a "remote-remote" pea/pod
-                    p = Pea(_args, allow_remote=False)
-                elif _req_type == jina_pb2.SpawnRequest.PodSpawnRequest:
-                    _args = set_pod_parser().parse_known_args(_req.args)[0]
-                    self.logger.info('starting a BasePod from a remote request')
-                    # need to return the new port and host ip number back
-                    # we do not allow remote spawn request to spawn a "remote-remote" pea/pod
-                    p = Pod(_args, allow_remote=False)
-                    from .remote import peas_args2mutable_pod_req
-                    request = peas_args2mutable_pod_req(p.peas_args)
-                elif _req_type == jina_pb2.SpawnRequest.MutablepodSpawnRequest:
-                    from .remote import mutable_pod_req2peas_args
-                    p = Pod(mutable_pod_req2peas_args(_req), allow_remote=False)
-                else:
-                    raise BadRequestType('don\'t know how to handle %r' % _req_type)
-
-                with p:
-                    self.peapods.append(p)
-                    for l in p.log_iterator:
-                        request.log_record = l.msg
-                        yield request
-                self.peapods.remove(p)
-            else:
-                warn_msg = f'the gateway at {self.args.host}:{self.args.port_expose} ' \
-                           f'does not support remote spawn, please restart it with --allow-spawn'
-                request.log_record = warn_msg
-                request.status.code = jina_pb2.Status.ERROR_NOTALLOWED
-                request.status.description = warn_msg
-                self.logger.warning(warn_msg)
-                for j in range(1):
-                    yield request
-
-        def close(self):
-            for p in self.peapods:
-                p.close()
-
 
 class RESTGatewayPea(BasePea):
     """A :class:`BasePea`-like class for holding a HTTP Gateway.
@@ -216,14 +169,11 @@ class RESTGatewayPea(BasePea):
         self.logger.close()
 
     def get_http_server(self):
-        try:
+        with ImportExtensions(required=True):
             from flask import Flask, Response, jsonify, request
             from flask_cors import CORS, cross_origin
             from gevent.pywsgi import WSGIServer
-        except ImportError:
-            raise ImportError('Flask or its dependencies are not fully installed, '
-                              'they are required for serving HTTP requests.'
-                              'Please use pip install "jina[http]" to install it.')
+
         app = Flask(__name__)
         app.config['CORS_HEADERS'] = 'Content-Type'
         CORS(app)
@@ -247,7 +197,7 @@ class RESTGatewayPea(BasePea):
             if 'data' not in content:
                 return http_error('"data" field is empty', 406)
 
-            content['mode'] = ClientMode.from_string(mode)
+            content['mode'] = RequestType.from_string(mode)
 
             results = get_result_in_json(getattr(python.request, mode)(**content))
             return Response(asyncio.run(results),

@@ -4,16 +4,30 @@ import multiprocessing as mp
 import pytest
 import numpy as np
 
-
-from jina.flow import Flow
-from jina.proto import jina_pb2
-from jina.parser import set_flow_parser
 from jina.enums import FlowOptimizeLevel
 from jina.executors.indexers.vector import NumpyIndexer
+from jina.flow import Flow
+from jina.parser import set_flow_parser
+from jina.proto import jina_pb2
+from jina import Document
 from tests import random_docs
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 
+
+@pytest.fixture(scope='function')
+def test_workspace_index(tmpdir):
+    os.environ['JINA_TEST_INDEX'] = str(tmpdir)
+    workspace_path = os.environ['JINA_TEST_INDEX']
+    yield workspace_path
+    del os.environ['JINA_TEST_INDEX']
+
+@pytest.fixture(scope='function')
+def test_workspace_joint(tmpdir):
+    os.environ['JINA_TEST_JOINT'] = str(tmpdir)
+    workspace_path = os.environ['JINA_TEST_JOINT']
+    yield workspace_path
+    del os.environ['JINA_TEST_JOINT']
 
 def get_result(resp):
     n = []
@@ -46,14 +60,12 @@ class DummyIndexer2(NumpyIndexer):
                 (vectors.shape[0], vectors.shape[1], self.num_dim))
         elif self.dtype != vectors.dtype.name:
             raise TypeError(
-                "vectors' dtype %s does not match with indexers's dtype: %s" %
-                (vectors.dtype.name, self.dtype))
+                f"vectors' dtype {vectors.dtype.name} does not match with indexers's dtype: {self.dtype}")
         elif keys.shape[0] != vectors.shape[0]:
             raise ValueError('number of key %d not equal to number of vectors %d' % (keys.shape[0], vectors.shape[0]))
         elif self.key_dtype != keys.dtype.name:
             raise TypeError(
-                "keys' dtype %s does not match with indexers keys's dtype: %s" %
-                (keys.dtype.name, self.key_dtype))
+                f"keys' dtype {keys.dtype.name} does not match with indexers keys's dtype: {self.key_dtype}")
 
         self.write_handler.write(vectors.tobytes())
         self.key_bytes += keys.tobytes()
@@ -64,12 +76,14 @@ class DummyIndexer2(NumpyIndexer):
 def test_doc_iters():
     docs = random_docs(3, 5)
     for doc in docs:
-        assert isinstance(doc, jina_pb2.Document)
+        assert isinstance(doc, Document)
+
 
 def test_simple_route():
-    f = Flow().add(uses='_pass')
+    f = Flow().add()
     with f:
         f.index(input_fn=random_docs(10))
+
 
 def test_update_method(test_metas):
     with DummyIndexer(index_filename='testa.bin', metas=test_metas) as indexer:
@@ -94,8 +108,8 @@ def test_update_method(test_metas):
 @pytest.mark.skipif('GITHUB_WORKFLOW' in os.environ, reason='skip the network test on github workflow')
 def test_two_client_route_parallel():
     fa1 = set_flow_parser().parse_args(['--optimize-level', str(FlowOptimizeLevel.NONE)])
-    f1 = Flow(fa1).add(uses='_pass', parallel=3)
-    f2 = Flow(optimize_level=FlowOptimizeLevel.IGNORE_GATEWAY).add(uses='_pass', parallel=3)
+    f1 = Flow(fa1).add(parallel=3)
+    f2 = Flow(optimize_level=FlowOptimizeLevel.IGNORE_GATEWAY).add(parallel=3)
 
     def start_client(fl):
         fl.index(input_fn=random_docs(10))
@@ -127,7 +141,7 @@ def test_two_client_route():
     def start_client(fl):
         fl.index(input_fn=random_docs(10))
 
-    with Flow().add(uses='_pass') as f:
+    with Flow().add() as f:
         t1 = mp.Process(target=start_client, args=(f,))
         t1.daemon = True
         t2 = mp.Process(target=start_client, args=(f,))
@@ -137,22 +151,19 @@ def test_two_client_route():
         t2.start()
 
 
-def test_index():
+def test_index(test_workspace_index):
     f = Flow().add(uses=os.path.join(cur_dir, 'yaml/test-index.yml'), parallel=3, separated_workspace=True)
     with f:
-        f.index(input_fn=random_docs(1000))
+        f.index(input_fn=random_docs(50))
 
     for j in range(3):
-        assert os.path.exists(f'test2-{j + 1}/test2.bin')
-        assert os.path.exists(f'test2-{j + 1}/tmp2')
-
-    with f:
-        f.search(input_fn=random_docs(2), output_fn=get_result, top_k=50)
+        assert os.path.join(test_workspace_index, f'test2-{j + 1}/test2.bin')
+        assert os.path.exists(os.path.join(test_workspace_index, f'test2-{j + 1}/tmp2'))
 
 
-def test_chunk_joint_idx():
+def test_compound_idx(test_workspace_joint):
     def validate(req, indexer_name):
-        assert req.status.code < jina_pb2.Status.ERROR
+        assert req.status.code < jina_pb2.StatusProto.ERROR
         assert req.search.docs[0].matches[0].score.op_name == indexer_name
 
     with Flow().add(uses=os.path.join(cur_dir, 'yaml/test-joint.yml')) as f:

@@ -5,7 +5,7 @@ import numpy as np
 
 from . import BaseKVIndexer
 from ...helper import cached_property
-from ...proto import uid
+from ...types.document import uid
 
 
 class BaseCache(BaseKVIndexer):
@@ -16,6 +16,8 @@ class BaseCache(BaseKVIndexer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+    def post_init(self):
         self.handler_mutex = False  #: for Cache we need to release the handler mutex to allow RW at the same time
 
 

@@ -76,8 +76,8 @@ if [ $LAST_COMMIT != $LAST_UPDATE ]; then
 fi
 
 # release the current version
-export RELEASE_VER=$(sed '6q;d' ./jina/__init__.py | cut -d \' -f2)
-printf "current version: \e[1;33m$RELEASE_VER\e[0m\n"
+export RELEASE_VER=$(sed -n '/^__version__/p' ./jina/__init__.py | cut -d \' -f2)
+printf "to-be released version: \e[1;33m$RELEASE_VER\e[0m\n"
 
 LAST_VER=$(git tag -l | sort -V | tail -n1)
 printf "last version: \e[1;32m$LAST_VER\e[0m\n"

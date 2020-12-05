@@ -4,9 +4,11 @@ from typing import Any
 import numpy as np
 import pytest
 
+from jina import DocumentSet
 from jina.drivers.cache import BaseCacheDriver
 from jina.executors.indexers.cache import DocIDCache
-from jina.proto import jina_pb2, uid
+from jina.proto import jina_pb2
+from jina.types.document import uid
 from tests import random_docs
 
 
@@ -16,18 +18,21 @@ class MockCacheDriver(BaseCacheDriver):
     def exec_fn(self):
         return self._exec_fn
 
-    def on_hit(self, req_doc: 'jina_pb2.Document', hit_result: Any) -> None:
+    def on_hit(self, req_doc: 'jina_pb2.DocumentProto', hit_result: Any) -> None:
         raise NotImplementedError
+
+    @property
+    def docs(self):
+        return DocumentSet(list(random_docs(10)))
 
 
 def test_cache_driver_twice(tmp_path):
     filename = tmp_path / 'test-tmp.bin'
-    docs = list(random_docs(10))
+    docs = DocumentSet(list(random_docs(10)))
     driver = MockCacheDriver()
     with DocIDCache(filename) as executor:
         assert not executor.handler_mutex
         driver.attach(executor=executor, pea=None)
-
         driver._traverse_apply(docs)
 
         with pytest.raises(NotImplementedError):

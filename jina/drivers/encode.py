@@ -1,14 +1,10 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Iterable
-
 from . import BaseExecutableDriver
-from .helper import extract_docs
-from ..proto.ndarray.generic import GenericNdArray
 
 if False:
-    from ..proto import jina_pb2
+    from ..types.sets import DocumentSet
 
 
 class BaseEncodeDriver(BaseExecutableDriver):
@@ -22,18 +18,18 @@ class EncodeDriver(BaseEncodeDriver):
     """Extract the chunk-level content from documents and call executor and do encoding
     """
 
-    def _apply_all(self, docs: Iterable['jina_pb2.Document'], *args, **kwargs) -> None:
-        contents, docs_pts, bad_doc_ids = extract_docs(docs, embedding=False)
+    def _apply_all(self, docs: 'DocumentSet', *args, **kwargs) -> None:
+        contents, docs_pts, bad_docs = docs.all_contents
 
-        if bad_doc_ids:
-            self.logger.warning(f'these bad docs can not be added: {bad_doc_ids} '
-                                f'from level depth {docs[0].granularity}')
+        if bad_docs:
+            self.logger.warning(f'these bad docs can not be added: {bad_docs} '
+                                f'from level depth {docs_pts[0].granularity}')
 
         if docs_pts:
             embeds = self.exec_fn(contents)
             if len(docs_pts) != embeds.shape[0]:
                 self.logger.error(
-                    f'mismatched {len(docs_pts)} docs from level {docs[0].granularity} '
+                    f'mismatched {len(docs_pts)} docs from level {docs_pts[0].granularity} '
                     f'and a {embeds.shape} shape embedding, the first dimension must be the same')
             for doc, embedding in zip(docs_pts, embeds):
-                GenericNdArray(doc.embedding).value = embedding
+                doc.embedding = embedding

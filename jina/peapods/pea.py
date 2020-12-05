@@ -6,25 +6,23 @@ import multiprocessing
 import os
 import threading
 import time
+from collections import defaultdict
 from multiprocessing.synchronize import Event
-from queue import Empty
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List
 
 import zmq
 
-from jina import __unable_to_load_pretrained_model_msg__
+from jina.types.message import Message
 from .zmq import send_ctrl_message, Zmqlet, ZmqStreamlet
-from .. import __ready_msg__, __stop_msg__
+from .. import __ready_msg__, __stop_msg__, Request
 from ..enums import PeaRoleType, SkipOnErrorType
 from ..excepts import NoExplicitMessage, ExecutorFailToLoad, MemoryOverHighWatermark, DriverError, PeaFailToStart, \
-    ModelCheckpointNotExist, ChainedPodException
+    ChainedPodException
 from ..executors import BaseExecutor
-from ..helper import is_valid_local_config_source
+from ..helper import is_valid_local_config_source, typename
 from ..logging import JinaLogger
 from ..logging.profile import used_memory, TimeDict
-from ..logging.queue import clear_queues
 from ..proto import jina_pb2
-from ..proto.message import ProtoMessage, LazyRequest
 
 __all__ = ['PeaMeta', 'BasePea']
 
@@ -115,10 +113,8 @@ class BasePea(metaclass=PeaMeta):
 
         self.is_ready_event = _get_event(self)
         self.is_shutdown = _get_event(self)
-        self.is_pretrained_model_exception = _get_event(self)
         self.ready_or_shutdown = _make_or_event(self, self.is_ready_event, self.is_shutdown)
         self.is_shutdown.clear()
-        self.is_pretrained_model_exception.clear()
 
         self.last_active_time = time.perf_counter()
         self.last_dump_time = time.perf_counter()
@@ -128,17 +124,21 @@ class BasePea(metaclass=PeaMeta):
         self._request = None
         self._message = None
 
+        # all pending messages collected so far, key is the request id
+        self._pending_msgs = defaultdict(list)  # type: Dict[str, List['Message']]
+        self._partial_requests = None
+        self._partial_messages = None
+
         if isinstance(self.args, argparse.Namespace):
             self.daemon = args.daemon
             if self.args.name:
                 self.name = self.args.name
             if self.args.role == PeaRoleType.PARALLEL:
-                self.name = '%s-%d' % (self.name, self.args.pea_id)
-            self.ctrl_addr, self.ctrl_with_ipc = Zmqlet.get_ctrl_address(self.args)
-            if self.args.name:
-                # everything in this Pea (process) will use the same name for display the log
-                os.environ['JINA_POD_NAME'] = self.args.name
-            self.logger = JinaLogger(self.name, **vars(self.args))
+                self.name = f'{self.name}-{self.args.pea_id}'
+            self.ctrl_addr, self.ctrl_with_ipc = Zmqlet.get_ctrl_address(self.args.host, self.args.port_ctrl, self.args.ctrl_with_ipc)
+            self.logger = JinaLogger(self.name,
+                                     log_id=self.args.log_id,
+                                     log_config=self.args.log_config)
         else:
             self.logger = JinaLogger(self.name)
 
@@ -148,14 +148,20 @@ class BasePea(metaclass=PeaMeta):
             r += f'({str(self.executor)})'
         return r
 
-    def handle(self, msg: 'ProtoMessage') -> 'BasePea':
+    def handle(self, msg: 'Message') -> 'BasePea':
         """Register the current message to this pea, so that all message-related properties are up-to-date, including
         :attr:`request`, :attr:`prev_requests`, :attr:`message`, :attr:`prev_messages`. And then call the executor to handle
         this message if its envelope's  status is not ERROR, else skip handling of message.
 
         :param msg: the message received
         """
-        if msg.envelope.status.code != jina_pb2.Status.ERROR or self.args.skip_on_error < SkipOnErrorType.HANDLE:
+
+        if self.expect_parts > 1 and self.expect_parts > len(self.partial_requests):
+            # NOTE: reduce priority is higher than chain exception
+            # otherwise a reducer will lose its function when eailier pods raise exception
+            raise NoExplicitMessage
+
+        if msg.envelope.status.code != jina_pb2.StatusProto.ERROR or self.args.skip_on_error < SkipOnErrorType.HANDLE:
             self.executor(self.request_type)
         else:
             raise ChainedPodException
@@ -167,12 +173,12 @@ class BasePea(metaclass=PeaMeta):
         return (time.perf_counter() - self.last_active_time) > self.args.max_idle_time
 
     @property
-    def request(self) -> 'LazyRequest':
+    def request(self) -> 'Request':
         """Get the current request body inside the protobuf message"""
         return self._request
 
     @property
-    def message(self) -> 'ProtoMessage':
+    def message(self) -> 'Message':
         """Get the current protobuf message to be processed"""
         return self._message
 
@@ -180,45 +186,30 @@ class BasePea(metaclass=PeaMeta):
     def request_type(self) -> str:
         return self._message.envelope.request_type
 
-    @property
-    def log_iterator(self):
-        """Get the last log using iterator """
-        from ..logging.queue import __log_queue__
-        while self.is_ready_event.is_set():
-            try:
-                yield __log_queue__.get_nowait()
-            except Empty:
-                pass
-
     def load_executor(self):
         """Load the executor to this BasePea, specified by ``uses`` CLI argument.
 
         """
-        if self.args.uses:
-            try:
-                self.executor = BaseExecutor.load_config(
-                    self.args.uses if is_valid_local_config_source(self.args.uses) else self.args.uses_internal,
-                    self.args.separated_workspace, self.args.pea_id)
-                self.executor.attach(pea=self)
-            except FileNotFoundError:
-                raise ExecutorFailToLoad
-            except ModelCheckpointNotExist as exception:
-                self.is_pretrained_model_exception.set()
-                raise exception
-        else:
-            self.logger.warning('this BasePea has no executor attached, you may want to double-check '
-                                'if it is a mistake or on purpose (using this BasePea as router/map-reduce)')
+        try:
+            self.executor = BaseExecutor.load_config(
+                self.args.uses if is_valid_local_config_source(self.args.uses) else self.args.uses_internal,
+                self.args.separated_workspace, self.args.pea_id)
+            self.executor.attach(pea=self)
+        except FileNotFoundError as ex:
+            self.logger.error(f'fail to load file dependency: {repr(ex)}')
+            raise ExecutorFailToLoad from ex
+        except Exception as ex:
+            raise ExecutorFailToLoad from ex
 
     def print_stats(self):
         self.logger.info(
-            ' '.join('%s: %.2f' % (k, v / self._timer.accum_time['loop']) for k, v in self._timer.accum_time.items()))
+            ' '.join(f'{k}: {v / self._timer.accum_time["loop"]:.2f}' for k, v in self._timer.accum_time.items()))
 
     def save_executor(self, dump_interval: int = 0):
         """Save the contained executor
 
         :param dump_interval: the time interval for saving
         """
-
         if ((time.perf_counter() - self.last_dump_time) > self.args.dump_interval > 0) or dump_interval <= 0:
             if self.args.read_only:
                 self.logger.debug('executor is not saved as "read_only" is set to true for this BasePea')
@@ -233,23 +224,50 @@ class BasePea(metaclass=PeaMeta):
             if hasattr(self, 'zmqlet'):
                 self.zmqlet.print_stats()
 
-    def pre_hook(self, msg: 'ProtoMessage') -> 'BasePea':
+    @property
+    def expect_parts(self) -> int:
+        """The expected number of partial messages before trigger :meth:`handle` """
+        return self.args.num_part if self.message.is_data_request else 1
+
+    @property
+    def partial_requests(self) -> List['Request']:
+        """The collected partial requests under the current ``request_id`` """
+        return self._partial_requests
+
+    @property
+    def partial_messages(self) -> List['Message']:
+        """The collected partial messages under the current ``request_id`` """
+        return self._partial_messages
+
+    def pre_hook(self, msg: 'Message') -> 'BasePea':
         """Pre-hook function, what to do after first receiving the message """
-        self.logger.info(f'received {msg.envelope.request_type} from {msg.colored_route}')
         msg.add_route(self.name, self.args.identity)
         self._request = msg.request
         self._message = msg
+
+        part_str = ' '
+        if self.expect_parts > 1:
+            req_id = msg.envelope.request_id
+            self._pending_msgs[req_id].append(msg)
+            self._partial_messages = self._pending_msgs[req_id]
+            self._partial_requests = [v.request for v in self._partial_messages]
+            part_str = f' ({len(self.partial_requests)}/{self.expect_parts} parts) '
+
+        self.logger.info(f'recv {msg.envelope.request_type}{part_str}from {msg.colored_route}')
         return self
 
-    def post_hook(self, msg: 'ProtoMessage') -> 'BasePea':
+    def post_hook(self, msg: 'Message') -> 'BasePea':
         """Post-hook function, what to do before handing out the message """
         # self.logger.critical(f'is message used: {msg.request.is_used}')
         self.last_active_time = time.perf_counter()
         self.save_executor(self.args.dump_interval)
         self.check_memory_watermark()
+
+        if self.expect_parts > 1:
+            msgs = self._pending_msgs.pop(msg.envelope.request_id)
+            msg.merge_envelope_from(msgs)
+
         msg.update_timestamp()
-        if self.args.num_part > 1:
-            msg.num_part = self.args.num_part
         return self
 
     def set_ready(self, *args, **kwargs):
@@ -262,7 +280,7 @@ class BasePea(metaclass=PeaMeta):
         self.is_ready_event.clear()
         self.logger.success(__stop_msg__)
 
-    def _callback(self, msg: 'ProtoMessage'):
+    def _callback(self, msg: 'Message'):
         self.is_post_hook_done = False  #: if the post_hook is called
         self.pre_hook(msg).handle(msg).post_hook(msg)
         self.is_post_hook_done = True
@@ -283,7 +301,7 @@ class BasePea(metaclass=PeaMeta):
         self.loop_teardown()
         self.is_shutdown.set()
 
-    def msg_callback(self, msg: 'ProtoMessage') -> Optional['ProtoMessage']:
+    def msg_callback(self, msg: 'Message') -> Optional['Message']:
         """Callback function after receiving the message
 
         When nothing is returned then the nothing is send out via :attr:`zmqlet.sock_out`.
@@ -314,6 +332,8 @@ class BasePea(metaclass=PeaMeta):
             else:
                 msg.add_exception(ex, executor=getattr(self, 'executor'))
                 self.logger.error(repr(ex))
+            if 'JINA_RAISE_ERROR_EARLY' in os.environ:
+                raise
             self.zmqlet.send_message(msg)
 
     def loop_body(self):
@@ -324,6 +344,8 @@ class BasePea(metaclass=PeaMeta):
             Class inherited from :class:`BasePea` must override this function. And add
             :meth:`set_ready` when your loop body is started
         """
+        os.environ['JINA_POD_NAME'] = self.name
+        os.environ['JINA_LOG_ID'] = self.args.log_id
         self.load_plugins()
         self.load_executor()
         self.zmqlet = ZmqStreamlet(self.args, logger=self.logger)
@@ -332,7 +354,7 @@ class BasePea(metaclass=PeaMeta):
 
     def load_plugins(self):
         if self.args.py_modules:
-            from ..helper import PathImporter
+            from ..importer import PathImporter
             PathImporter.add_modules(*self.args.py_modules)
 
     def loop_teardown(self):
@@ -343,6 +365,7 @@ class BasePea(metaclass=PeaMeta):
     def run(self):
         """Start the request loop of this BasePea. It will listen to the network protobuf message via ZeroMQ. """
         try:
+            # Every logger created in this process will be identified by the `Pod Id` and use the same name
             self.post_init()
             self.loop_body()
         except ExecutorFailToLoad:
@@ -355,9 +378,6 @@ class BasePea(metaclass=PeaMeta):
             self.logger.critical(f'driver error: {repr(ex)}', exc_info=True)
         except zmq.error.ZMQError:
             self.logger.critical('zmqlet can not be initiated')
-        except ModelCheckpointNotExist:
-            self.logger.critical(__unable_to_load_pretrained_model_msg__)
-            self.is_pretrained_model_exception.set()
         except Exception as ex:
             # this captures the general exception from the following places:
             # - self.zmqlet.recv_message
@@ -384,15 +404,14 @@ class BasePea(metaclass=PeaMeta):
     def send_terminate_signal(self) -> None:
         """Gracefully close this pea and release all resources """
         if self.is_ready_event.is_set() and hasattr(self, 'ctrl_addr'):
-            send_ctrl_message(self.ctrl_addr, jina_pb2.Request.ControlRequest.TERMINATE,
+            send_ctrl_message(self.ctrl_addr, 'TERMINATE',
                               timeout=self.args.timeout_ctrl)
 
     @property
     def status(self):
         """Send the control signal ``STATUS`` to itself and return the status """
         if self.is_ready_event.is_set() and getattr(self, 'ctrl_addr'):
-            return send_ctrl_message(self.ctrl_addr, jina_pb2.Request.ControlRequest.STATUS,
-                                     timeout=self.args.timeout_ctrl)
+            return send_ctrl_message(self.ctrl_addr, 'STATUS', timeout=self.args.timeout_ctrl)
 
     def start(self) -> 'BasePea':
         super().start()
@@ -409,16 +428,13 @@ class BasePea(metaclass=PeaMeta):
         if self.ready_or_shutdown.wait(_timeout):
             if self.is_shutdown.is_set():
                 # return too early and the shutdown is set, means something fails!!
-                self.logger.critical(f'fail to start {self.__class__} with name {self.name}, '
+                self.logger.critical(f'fail to start {typename(self)} with name {self.name}, '
                                      f'this often means the executor used in the pod is not valid')
-                if self.is_pretrained_model_exception.is_set():
-                    raise ModelCheckpointNotExist
-                else:
-                    raise PeaFailToStart
+                raise PeaFailToStart
             return self
         else:
             raise TimeoutError(
-                f'{self.__class__} with name {self.name} can not be initialized after {_timeout * 1e3}ms')
+                f'{typename(self)} with name {self.name} can not be initialized after {_timeout * 1e3}ms')
 
     def __enter__(self) -> 'BasePea':
         return self.start()
@@ -427,7 +443,6 @@ class BasePea(metaclass=PeaMeta):
         self.send_terminate_signal()
         self.is_shutdown.wait()
         if not self.daemon:
-            clear_queues()
             self.logger.close()
             self.join()
 

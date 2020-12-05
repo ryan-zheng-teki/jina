@@ -1,8 +1,65 @@
-import numpy as np
+import os
 
-from jina.clients.python.request import _generate
+import numpy as np
+import pytest
+from google.protobuf.json_format import MessageToJson, MessageToDict
+
+from jina import Document
+from jina.clients.python.request import _generate, _build_doc
+from jina.enums import DataInputType
+from jina.excepts import BadDocType
 from jina.proto import jina_pb2
-from jina.proto.ndarray.generic import GenericNdArray
+from jina.proto.jina_pb2 import DocumentProto
+from jina.types.ndarray.generic import NdArray
+
+
+@pytest.mark.parametrize('builder', [lambda x: x.SerializeToString(),
+                                     lambda x: MessageToJson(x),
+                                     lambda x: MessageToDict(x),
+                                     lambda x: Document(x)])
+def test_data_type_builder_doc(builder):
+    a = DocumentProto()
+    a.id = 'a236cbb0eda62d58'
+    d, t = _build_doc(builder(a), DataInputType.DOCUMENT, override_doc_id=False)
+    assert d.id == a.id
+    assert t == DataInputType.DOCUMENT
+
+
+def test_data_type_builder_doc_bad():
+    a = DocumentProto()
+    a.id = 'a236cbb0eda62d58'
+    with pytest.raises(BadDocType):
+        _build_doc(b'BREAKIT!' + a.SerializeToString(), DataInputType.DOCUMENT, override_doc_id=False)
+
+    with pytest.raises(BadDocType):
+        _build_doc(MessageToJson(a) + '🍔', DataInputType.DOCUMENT, override_doc_id=False)
+
+    with pytest.raises(BadDocType):
+        _build_doc({'🍔': '🍔'}, DataInputType.DOCUMENT, override_doc_id=False)
+
+
+@pytest.mark.parametrize('input_type', [DataInputType.AUTO, DataInputType.CONTENT])
+def test_data_type_builder_auto(input_type):
+    if 'JINA_ARRAY_QUANT' in os.environ:
+        print(f'quant is on: {os.environ["JINA_ARRAY_QUANT"]}')
+        del os.environ['JINA_ARRAY_QUANT']
+
+    d, t = _build_doc('123', input_type, override_doc_id=True)
+    assert d.text == '123'
+    assert t == DataInputType.CONTENT
+
+    d, t = _build_doc(b'45678', input_type, override_doc_id=True)
+    assert t == DataInputType.CONTENT
+    assert d.buffer == b'45678'
+
+    d, t = _build_doc(b'123', input_type, override_doc_id=True)
+    assert t == DataInputType.CONTENT
+    assert d.buffer == b'123'
+
+    c = np.random.random([10, 10])
+    d, t = _build_doc(c, input_type, override_doc_id=True)
+    np.testing.assert_equal(d.blob, c)
+    assert t == DataInputType.CONTENT
 
 
 def test_request_generate_lines():
@@ -67,7 +124,7 @@ def test_request_generate_bytes():
 def test_request_generate_docs():
     def random_docs(num_docs):
         for j in range(1, num_docs + 1):
-            doc = jina_pb2.Document()
+            doc = jina_pb2.DocumentProto()
             doc.text = f'i\'m dummy doc {j}'
             doc.offset = 1000
             doc.tags['id'] = 1000  # this will be ignored
@@ -85,6 +142,82 @@ def test_request_generate_docs():
         assert doc.offset == 1000
 
 
+def test_request_generate_dict():
+    def random_docs(num_docs):
+        for j in range(1, num_docs + 1):
+            doc = {
+                'text': f'i\'m dummy doc {j}',
+                'offset': 1000,
+                'tags': {
+                    'id': 1000
+                },
+                'chunks': [
+                    {
+                        'text': f'i\'m chunk 1',
+                        'modality': 'text'
+                    },
+                    {
+                        'text': f'i\'m chunk 2',
+                        'modality': 'image'
+                    },
+                ]
+            }
+            yield doc
+
+    req = _generate(data=random_docs(100), batch_size=100)
+
+    request = next(req)
+    assert len(request.index.docs) == 100
+    for index, doc in enumerate(request.index.docs, 1):
+        assert doc.text == f'i\'m dummy doc {index}'
+        assert doc.offset == 1000
+        assert doc.tags['id'] == 1000
+        assert len(doc.chunks) == 2
+        assert doc.chunks[0].modality == 'text'
+        assert doc.chunks[0].text == f'i\'m chunk 1'
+        assert doc.chunks[1].modality == 'image'
+        assert doc.chunks[1].text == f'i\'m chunk 2'
+
+
+def test_request_generate_dict_str():
+    import json
+
+    def random_docs(num_docs):
+        for j in range(1, num_docs + 1):
+            doc = {
+                'text': f'i\'m dummy doc {j}',
+                'offset': 1000,
+                'tags': {
+                    'id': 1000
+                },
+                'chunks': [
+                    {
+                        'text': f'i\'m chunk 1',
+                        'modality': 'text'
+                    },
+                    {
+                        'text': f'i\'m chunk 2',
+                        'modality': 'image'
+                    },
+                ]
+            }
+            yield json.dumps(doc)
+
+    req = _generate(data=random_docs(100), batch_size=100)
+
+    request = next(req)
+    assert len(request.index.docs) == 100
+    for index, doc in enumerate(request.index.docs, 1):
+        assert doc.text == f'i\'m dummy doc {index}'
+        assert doc.offset == 1000
+        assert doc.tags['id'] == 1000
+        assert len(doc.chunks) == 2
+        assert doc.chunks[0].modality == 'text'
+        assert doc.chunks[0].text == f'i\'m chunk 1'
+        assert doc.chunks[1].modality == 'image'
+        assert doc.chunks[1].text == f'i\'m chunk 2'
+
+
 def test_request_generate_numpy_arrays():
     input_array = np.random.random([10, 10])
 
@@ -94,13 +227,13 @@ def test_request_generate_numpy_arrays():
     assert len(request.index.docs) == 5
     for index, doc in enumerate(request.index.docs, 1):
         assert doc.length == 5
-        assert GenericNdArray(doc.blob).value.shape == (10,)
+        assert NdArray(doc.blob).value.shape == (10,)
 
     request = next(req)
     assert len(request.index.docs) == 5
     for index, doc in enumerate(request.index.docs, 1):
         assert doc.length == 5
-        assert GenericNdArray(doc.blob).value.shape == (10,)
+        assert NdArray(doc.blob).value.shape == (10,)
 
 
 def test_request_generate_numpy_arrays_iterator():
@@ -116,10 +249,10 @@ def test_request_generate_numpy_arrays_iterator():
     assert len(request.index.docs) == 5
     for index, doc in enumerate(request.index.docs, 1):
         assert doc.length == 5
-        assert GenericNdArray(doc.blob).value.shape == (10,)
+        assert NdArray(doc.blob).value.shape == (10,)
 
     request = next(req)
     assert len(request.index.docs) == 5
     for index, doc in enumerate(request.index.docs, 1):
         assert doc.length == 5
-        assert GenericNdArray(doc.blob).value.shape == (10,)
+        assert NdArray(doc.blob).value.shape == (10,)

@@ -1,129 +1,87 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-import mimetypes
-import os
-import urllib.parse
-import uuid
-from typing import Iterator, Union, Tuple
+from typing import Iterator, Union, Tuple, Sequence
 
-import numpy as np
+from ... import Request
+from ...enums import RequestType, DataInputType
+from ...excepts import BadDocType
+from ...helper import batch_iterator
+from ...types.document import Document, DocumentSourceType, DocumentContentType
+from ...types.querylang import QueryLang
+from ...types.sets.querylang_set import AcceptQueryLangType
 
-from ...drivers.helper import guess_mime
-from ...enums import ClientMode
-from ...helper import batch_iterator, is_url
-from ...logging import default_logger
-from ...proto import jina_pb2, uid
-from ...proto.ndarray.generic import GenericNdArray
-
-
-def _fill_document(document: 'jina_pb2.Document',
-                   content: Union['jina_pb2.Document', 'np.ndarray', bytes, str, Tuple[
-                       Union['jina_pb2.Document', bytes], Union['jina_pb2.Document', bytes]]],
-                   docs_in_same_batch: int,
-                   mime_type: str,
-                   buffer_sniff: bool,
-                   override_doc_id: bool = True
-                   ):
-    if isinstance(content, jina_pb2.Document):
-        document.CopyFrom(content)
-    elif isinstance(content, np.ndarray):
-        GenericNdArray(document.blob).value = content
-    elif isinstance(content, bytes):
-        document.buffer = content
-        if not mime_type and buffer_sniff:
-            try:
-                import magic
-
-                mime_type = magic.from_buffer(content, mime=True)
-            except Exception as ex:
-                default_logger.warning(
-                    f'can not sniff the MIME type due to the exception {repr(ex)}'
-                )
-    elif isinstance(content, str):
-        scheme = urllib.parse.urlparse(content).scheme
-        if (
-                (scheme in {'http', 'https'} and is_url(content))
-                or (scheme in {'data'})
-                or os.path.exists(content)
-                or os.access(os.path.dirname(content), os.W_OK)
-        ):
-            document.uri = content
-            mime_type = guess_mime(content)
-        else:
-            document.text = content
-            mime_type = 'text/plain'
-    else:
-        raise TypeError(f'{type(content)} type of input is not supported')
-
-    if mime_type:
-        document.mime_type = mime_type
-
-    # TODO: I don't like this part, this change the original docs inplace!
-    #   why can't delegate this to crafter? (Han)
-    document.weight = 1.0
-    document.length = docs_in_same_batch
-
-    if override_doc_id:
-        document.id = uid.new_doc_id(document)
+GeneratorSourceType = Iterator[Union[DocumentContentType,
+                                     DocumentSourceType,
+                                     Tuple[DocumentContentType, DocumentContentType],
+                                     Tuple[DocumentSourceType, DocumentSourceType]]]
 
 
-def _generate(data: Union[Iterator[Union['jina_pb2.Document', bytes]], Iterator[
-    Tuple[Union['jina_pb2.Document', bytes], Union['jina_pb2.Document', bytes]]], Iterator['np.ndarray'], Iterator[
-                              str], 'np.ndarray',],
-              batch_size: int = 0, mode: ClientMode = ClientMode.INDEX,
+def _build_doc(data, data_type: DataInputType, override_doc_id, **kwargs) -> Tuple['Document', 'DataInputType']:
+    def _build_doc_from_content():
+        with Document(**kwargs) as d:
+            d.content = data
+        # note that there is no point to check override_doc_id here
+        # as no doc_id is given when use _generate in this way
+        return d, DataInputType.CONTENT
+
+    if data_type == DataInputType.AUTO or data_type == DataInputType.DOCUMENT:
+        if isinstance(data, Document):
+            # if incoming is already primitive type Document, then all good, best practice!
+            return data, DataInputType.DOCUMENT
+        try:
+            d = Document(data, **kwargs)
+            if override_doc_id:
+                d.update_id()
+            return d, DataInputType.DOCUMENT
+        except BadDocType:
+            # AUTO has a fallback, now reconsider it as content
+            if data_type == DataInputType.AUTO:
+                return _build_doc_from_content()
+            else:
+                raise
+    elif data_type == DataInputType.CONTENT:
+        return _build_doc_from_content()
+
+
+def _generate(data: GeneratorSourceType,
+              batch_size: int = 0,
+              mode: RequestType = RequestType.INDEX,
               mime_type: str = None,
               override_doc_id: bool = True,
-              queryset: Iterator['jina_pb2.QueryLang'] = None,
-              *args,
-              **kwargs,
-              ) -> Iterator['jina_pb2.Request']:
-    buffer_sniff = False
+              queryset: Union[AcceptQueryLangType, Iterator[AcceptQueryLangType]] = None,
+              data_type: DataInputType = DataInputType.AUTO,
+              **kwargs  # do not remove this, add on purpose to suppress unknown kwargs
+              ) -> Iterator['Request']:
+    """
+    :param data_type: if ``data`` is an iterator over self-contained document, i.e. :class:`DocumentSourceType`;
+            or an interator over possible Document content (set to text, blob and buffer).
+    :return:
+    """
 
-    try:
-        import magic
-
-        buffer_sniff = True
-    except (ImportError, ModuleNotFoundError):
-        default_logger.warning(
-            f'can not sniff the MIME type '
-            f'MIME sniffing requires pip install "jina[http]" '
-            f'and brew install libmagic (Mac)/ apt-get install libmagic1 (Linux)'
-        )
-
-    if mime_type and (mime_type not in mimetypes.types_map.values()):
-        mime_type = mimetypes.guess_type(f'*.{mime_type}')[0]
-
-    if isinstance(mode, str):
-        mode = ClientMode.from_string(mode)
-
-    _fill = lambda x, y: _fill_document(document=x,
-                                        content=y,
-                                        docs_in_same_batch=batch_size,
-                                        mime_type=mime_type,
-                                        buffer_sniff=buffer_sniff,
-                                        override_doc_id=override_doc_id
-                                        )
+    _kwargs = dict(mime_type=mime_type, length=batch_size, weight=1.0)
 
     for batch in batch_iterator(data, batch_size):
-        req = jina_pb2.Request()
-        req.request_id = uuid.uuid1().hex
-        if queryset:
-            if isinstance(queryset, jina_pb2.QueryLang):
-                queryset = [queryset]
-            req.queryset.extend(queryset)
-
-        _req = getattr(req, str(mode).lower())
+        req = Request()
+        req.request_type = str(mode)
         for content in batch:
-            d = _req.docs.add()
             if isinstance(content, tuple) and len(content) == 2:
-                default_logger.debug('content comes in pair, '
-                                     'will take the first as the input and the scond as the groundtruth')
-                gt = _req.groundtruths.add()
-                _fill(d, content[0])
-                _fill(gt, content[1])
+                # content comes in pair,  will take the first as the input and the second as the groundtruth
+
+                # note how data_type is cached
+                d, data_type = _build_doc(content[0], data_type, override_doc_id, **_kwargs)
+                gt, _ = _build_doc(content[1], data_type, override_doc_id, **_kwargs)
+                req.docs.append(d)
+                req.groundtruths.append(gt)
             else:
-                _fill(d, content)
+                d, data_type = _build_doc(content, data_type, override_doc_id, **_kwargs)
+                req.docs.append(d)
+
+        if isinstance(queryset, Sequence):
+            req.queryset.extend(queryset)
+        elif queryset is not None:
+            req.queryset.append(queryset)
+
         yield req
 
 
@@ -135,8 +93,7 @@ def index(*args, **kwargs):
 def train(*args, **kwargs):
     """Generate a training request """
     yield from _generate(*args, **kwargs)
-    req = jina_pb2.Request()
-    req.request_id = uuid.uuid1().hex
+    req = Request()
     req.train.flush = True
     yield req
 
@@ -144,14 +101,12 @@ def train(*args, **kwargs):
 def search(*args, **kwargs):
     """Generate a searching request """
     if ('top_k' in kwargs) and (kwargs['top_k'] is not None):
-        top_k_queryset = jina_pb2.QueryLang()
-        top_k_queryset.name = 'VectorSearchDriver'
-        top_k_queryset.priority = 1
-        top_k_queryset.parameters['top_k'] = kwargs['top_k']
+        from jina.drivers.search import VectorSearchDriver
+        topk_ql = QueryLang(VectorSearchDriver(top_k=kwargs['top_k'], priority=1))
         if 'queryset' not in kwargs:
-            kwargs['queryset'] = [top_k_queryset]
+            kwargs['queryset'] = [topk_ql]
         else:
-            kwargs['queryset'].append(top_k_queryset)
+            kwargs['queryset'].append(topk_ql)
     yield from _generate(*args, **kwargs)
 
 

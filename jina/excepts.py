@@ -88,12 +88,12 @@ class BadClientCallback(BadClient):
     """Error in the callback function on the client side"""
 
 
+class BadClientRequestGenerator(BadClient):
+    """Error in the request generator function on the client side"""
+
+
 class BadPersistantFile(Exception):
     """Bad or broken dump file that can not be deserialized with ``pickle.load``"""
-
-
-class BadRequestType(Exception):
-    """Bad request type and the pod does not know how to handle """
 
 
 class GRPCServerError(Exception):
@@ -120,7 +120,7 @@ class DockerLoginFailed(Exception):
     """ Exception to raise for docker hub login failures """
 
 
-class ModelCheckpointNotExist(Exception):
+class ModelCheckpointNotExist(FileNotFoundError):
     """ Exception to raise for executors depending on pretrained model files when they do not exist """
 
 
@@ -131,11 +131,45 @@ class PretrainedModelFileDoesNotExist(ModelCheckpointNotExist):
     """
 
 
-class CompressionRateTooLow(Exception):
-    """ Compression rate is too low, no need to compression
+class HubBuilderError(Exception):
+    """ Base exception to raise when :command:`jina hub build` fails"""
 
-    """
+
+class HubBuilderBuildError(HubBuilderError):
+    """ Exception to raise when :command:`jina hub build` fails to build image"""
+
+
+class HubBuilderTestError(HubBuilderError):
+    """ Exception to raise when :command:`jina hub build` fails to test image"""
+
+
+class CompressionRateTooLow(Exception):
+    """ Compression rate is too low, no need to compression"""
+
+
+class DryRunException(Exception):
+    """Dryrun is not successful on the given flow"""
 
 
 class BadDocID(Exception):
     """ Exception when user give a non-hex string as the doc id """
+
+
+class BadDocType(TypeError):
+    """ Exception when can not construct a document from the given data """
+
+
+class BadQueryLangType(TypeError):
+    """ Exception when can not construct a query language from the given data """
+
+
+class BadRequestType(TypeError):
+    """Exception when can not construct a request object from given data"""
+
+
+class RemotePodClosed(Exception):
+    """ Exception when remote pod is closed and log streaming needs to exit """
+
+
+class LengthMismatchException(Exception):
+    """ Exception when length of two items should be identical while not """

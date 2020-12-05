@@ -9,24 +9,23 @@ import re
 import sys
 import time
 import uuid
+import warnings
 from argparse import ArgumentParser, Namespace
 from datetime import datetime
 from io import StringIO
 from itertools import islice
-from types import SimpleNamespace, ModuleType
+from types import SimpleNamespace
 from typing import Tuple, Optional, Iterator, Any, Union, List, Dict, Set, TextIO, Sequence, Iterable
 
+import numpy as np
 from ruamel.yaml import YAML, nodes
 
-if False:
-    from uvloop import Loop
-
 __all__ = ['batch_iterator', 'yaml',
-           'load_contrib_module',
            'parse_arg',
-           'PathImporter', 'random_port', 'get_random_identity', 'expand_env_var',
+           'random_port', 'get_random_identity', 'expand_env_var',
            'colored', 'kwargs2list', 'get_local_config_source', 'is_valid_local_config_source',
-           'cached_property', 'is_url', 'complete_path']
+           'cached_property', 'is_url', 'complete_path',
+           'typename', 'get_public_ip', 'get_internal_ip', 'convert_tuple_to_list']
 
 
 def deprecated_alias(**aliases):
@@ -42,14 +41,13 @@ def deprecated_alias(**aliases):
 
 
 def rename_kwargs(func_name: str, kwargs, aliases):
-    from .logging import default_logger
     for alias, new in aliases.items():
         if alias in kwargs:
             if new in kwargs:
                 raise TypeError(f'{func_name} received both {alias} and {new}')
-            default_logger.warning(
+            warnings.warn(
                 f'"{alias}" is deprecated in "{func_name}()" '
-                f'and will be removed in the next version; please use "{new}" instead')
+                f'and will be removed in the next version; please use "{new}" instead', DeprecationWarning)
             kwargs[new] = kwargs.pop(alias)
 
 
@@ -63,62 +61,6 @@ def get_readable_size(num_bytes: Union[int, float]) -> str:
         return f'{num_bytes / (1024 ** 2):.1f} MB'
     else:
         return f'{num_bytes / (1024 ** 3):.1f} GB'
-
-
-def print_load_table(load_stat: Dict[str, List[Any]]):
-    from .logging import default_logger
-
-    load_table = []
-    cached = set()
-
-    for k, v in load_stat.items():
-        for cls_name, import_stat, err_reason in v:
-            if cls_name not in cached:
-                load_table.append('%-5s %-25s %-40s %s' % (
-                    colored('✓', 'green') if import_stat else colored('✗', 'red'),
-                    cls_name if cls_name else colored('Module load error', 'red'), k, str(err_reason)))
-                cached.add(cls_name)
-    if load_table:
-        load_table.sort()
-        load_table = ['', '%-5s %-25s %-40s %-s' % ('Load', 'Class', 'Module', 'Dependency'),
-                      '%-5s %-25s %-40s %-s' % ('-' * 5, '-' * 25, '-' * 40, '-' * 10)] + load_table
-        default_logger.info('\n'.join(load_table))
-
-
-def print_load_csv_table(load_stat: Dict[str, List[Any]]):
-    from .logging import default_logger
-
-    load_table = []
-    for k, v in load_stat.items():
-        for cls_name, import_stat, err_reason in v:
-            load_table.append('%s %s %s %s' % (
-                colored('✓', 'green') if import_stat else colored('✗', 'red'),
-                cls_name if cls_name else colored('Module_load_error', 'red'), k, str(err_reason)))
-    if load_table:
-        default_logger.info('\n'.join(load_table))
-
-
-def print_dep_tree_rst(fp, dep_tree, title='Executor'):
-    tableview = set()
-    treeview = []
-
-    def _iter(d, depth):
-        for k, v in d.items():
-            if k != 'module':
-                treeview.append('   ' * depth + f'- `{k}`')
-                tableview.add(f'| `{k}` | ' + (f'`{d["module"]}`' if 'module' in d else ' ') + ' |')
-                _iter(v, depth + 1)
-
-    _iter(dep_tree, 0)
-
-    fp.write(f'# List of {len(tableview)} {title}s in Jina\n\n'
-             f'This version of Jina includes {len(tableview)} {title}s.\n\n'
-             f'## Inheritances in a Tree View\n')
-    fp.write('\n'.join(treeview))
-
-    fp.write(f'\n\n## Modules in a Table View \n\n| Class | Module |\n')
-    fp.write('| --- | --- |\n')
-    fp.write('\n'.join(sorted(tableview)))
 
 
 def call_obj_fn(obj, fn: str):
@@ -218,63 +160,6 @@ def countdown(t: int, reason: str = 'I am blocking this thread') -> None:
         sys.stdout.write('no more patience? good bye!')
 
 
-def load_contrib_module() -> Optional[List[Any]]:
-    if 'JINA_CONTRIB_MODULE_IS_LOADING' not in os.environ:
-
-        contrib = os.getenv('JINA_CONTRIB_MODULE')
-        os.environ['JINA_CONTRIB_MODULE_IS_LOADING'] = 'true'
-
-        modules = []
-
-        if contrib:
-            from .logging import default_logger
-            default_logger.info(
-                f'find a value in $JINA_CONTRIB_MODULE={contrib}, will load them as external modules')
-            for p in contrib.split(','):
-                m = PathImporter.add_modules(p)
-                modules.append(m)
-                default_logger.info(f'successfully registered {m} class, you can now use it via yaml.')
-    else:
-        modules = None
-
-    return modules
-
-
-class PathImporter:
-
-    @staticmethod
-    def _get_module_name(path: str, use_abspath: bool = False, use_basename: bool = True) -> str:
-        module_name = os.path.dirname(os.path.abspath(path) if use_abspath else path)
-        if use_basename:
-            module_name = os.path.basename(module_name)
-        module_name = module_name.replace('/', '.').strip('.')
-        return module_name
-
-    @staticmethod
-    def add_modules(*paths) -> Optional[ModuleType]:
-        for p in paths:
-            if not os.path.exists(p):
-                raise FileNotFoundError('cannot import module from %s, file not exist', p)
-            module = PathImporter._path_import(p)
-        return module
-
-    @staticmethod
-    def _path_import(absolute_path: str) -> Optional[ModuleType]:
-        import importlib.util
-        try:
-            # module_name = (PathImporter._get_module_name(absolute_path) or
-            #                PathImporter._get_module_name(absolute_path, use_abspath=True) or 'jinahub')
-
-            # I dont want to trust user path based on directory structure, "jinahub", period
-            spec = importlib.util.spec_from_file_location('jinahub', absolute_path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module  # add this line
-            spec.loader.exec_module(module)
-        except ModuleNotFoundError:
-            module = None
-        return module
-
-
 _random_names = (('first', 'great', 'local', 'small', 'right', 'large', 'young', 'early', 'major', 'clear', 'black',
                   'whole', 'third', 'white', 'short', 'human', 'royal', 'wrong', 'legal', 'final', 'close', 'total',
                   'prime', 'happy', 'sorry', 'basic', 'aware', 'ready', 'green', 'heavy', 'extra', 'civil', 'chief',
@@ -305,18 +190,20 @@ def random_port() -> Optional[int]:
 
     _port = None
     if 'JINA_RANDOM_PORTS' in os.environ:
-        min_port, max_port = 49152, 65535
-        while True:
-            _port = random.randrange(min_port, max_port)
+        min_port = int(os.environ.get('JINA_RANDOM_PORT_MIN', '49153'))
+        max_port = int(os.environ.get('JINA_RANDOM_PORT_MAX', '65535'))
+        for _port in np.random.permutation(range(min_port, max_port + 1)):
             if _get_port(_port) is not None:
                 break
+        else:
+            raise OSError(f'Couldn\'t find an available port in [{min_port}, {max_port}].')
     else:
         _port = _get_port()
     return _port
 
 
 def get_random_identity() -> str:
-    return uuid.uuid1().hex
+    return str(uuid.uuid1())
 
 
 yaml = _get_yaml()
@@ -520,8 +407,8 @@ def get_local_config_source(path: str, to_stream: bool = False) -> Union[StringI
         _p = complete_path(path)
         return open(_p, encoding='utf8') if to_stream else _p
     elif path.startswith('_') and os.path.exists(
-            resource_filename('jina', '/'.join(('resources', 'executors.%s.yml' % path)))):
-        return resource_filename('jina', '/'.join(('resources', 'executors.%s.yml' % path)))
+            resource_filename('jina', '/'.join(('resources', f'executors.{path}.yml')))):
+        return resource_filename('jina', '/'.join(('resources', f'executors.{path}.yml')))
     elif path.startswith('!'):
         # possible YAML content
         path = path.replace('|', '\n    with: ')
@@ -564,8 +451,8 @@ def get_parsed_args(kwargs: Dict[str, Union[str, int, bool]],
                 f'they are ignored. if you are using them from a global args (e.g. Flow), '
                 f'then please ignore this message')
     except SystemExit:
-        raise ValueError('bad arguments "%s" with parser %r, '
-                         'you may want to double check your args ' % (args, parser))
+        raise ValueError(f'bad arguments "{args}" with parser {parser}, '
+                         'you may want to double check your args ')
     return args, p_args, unknown_args
 
 
@@ -624,23 +511,22 @@ def format_full_version_info(info: Dict, env_info: Dict) -> str:
 
 def use_uvloop():
     if 'JINA_DISABLE_UVLOOP' not in os.environ:
-        try:
+        from .importer import ImportExtensions
+        with ImportExtensions(required=False,
+                              help_text='Jina uses uvloop to manage events and sockets, '
+                                        'it often yields better performance than builtin asyncio'):
             import asyncio
             import uvloop
             asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        except (ModuleNotFoundError, ImportError):
-            from .logging import default_logger
-            default_logger.error(
-                'Since v0.3.6 jina uses uvloop to manage events and sockets, it often yields 20% speedup'
-                'you did not install uvloop. Try "pip install uvloop"')
 
 
-def show_ioloop_backend(loop: Optional['Loop'] = None) -> None:
-    if loop is None:
-        import asyncio
-        loop = asyncio.get_event_loop()
-    from .logging import default_logger
-    default_logger.info(f'using {loop.__class__} as event loop')
+def typename(obj):
+    if not isinstance(obj, type):
+        obj = obj.__class__
+    try:
+        return f'{obj.__module__}.{obj.__name__}'
+    except AttributeError:
+        return str(obj)
 
 
 def rsetattr(obj, attr: str, val):
@@ -676,28 +562,34 @@ def get_now_timestamp():
     return int(datetime.timestamp(now))
 
 
-def complete_path(path: str) -> str:
+def search_file_in_paths(path):
+    '''
+        searches in all dirs of the PATH environment variable and all dirs of files used in the call stack.
+    '''
     import inspect
-    _p = None
+    search_paths = []
+    frame = inspect.currentframe()
 
+    # iterates over the call stack
+    while frame:
+        search_paths.append(os.path.dirname(inspect.getfile(frame)))
+        frame = frame.f_back
+    search_paths += os.environ['PATH'].split(os.pathsep)
+
+    # return first occurrence of path. If it does not exist, return None.
+    for p in search_paths:
+        _p = os.path.join(p, path)
+        if os.path.exists(_p):
+            return _p
+
+
+def complete_path(path: str) -> str:
+    _p = None
     if os.path.exists(path):
         # this checks both abs and relative paths already
         _p = path
     else:
-        search_paths = []
-        frame = inspect.currentframe()
-
-        # iterates on whoever calls me
-        while frame:
-            search_paths.append(os.path.dirname(inspect.getfile(frame)))
-            frame = frame.f_back
-        search_paths += os.environ['PATH'].split(os.pathsep)
-
-        # not in local path, search within all search paths
-        for p in search_paths:
-            _p = os.path.join(p, path)
-            if os.path.exists(_p):
-                break
+        _p = search_file_in_paths(path)
     if _p:
         return _p
     else:
@@ -718,3 +610,42 @@ def get_readable_time(*args, **kwargs):
                 n = int(secs)
             parts.append(f'{n} {unit}' + ('' if n == 1 else 's'))
     return ' and '.join(parts)
+
+
+def get_internal_ip():
+    import socket
+    ip = '127.0.0.1'
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # doesn't even have to be reachable
+            s.connect(('10.255.255.255', 1))
+            ip = s.getsockname()[0]
+    except Exception:
+        pass
+    return ip
+
+
+def get_public_ip():
+    # 'https://api.ipify.org'
+    # https://ident.me
+    # ipinfo.io/ip
+    import urllib.request
+
+    def _get_ip(url):
+        try:
+            with urllib.request.urlopen(url, timeout=1) as fp:
+                return fp.read().decode('utf8')
+        except:
+            pass
+
+    ip = _get_ip('https://api.ipify.org') or _get_ip('https://ident.me') or _get_ip('https://ipinfo.io/ip')
+
+    return ip
+
+
+def convert_tuple_to_list(d: Dict):
+    for k, v in d.items():
+        if isinstance(v, tuple):
+            d[k] = list(v)
+        elif isinstance(v, dict):
+            convert_tuple_to_list(v)

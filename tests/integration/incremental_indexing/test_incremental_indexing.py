@@ -1,5 +1,6 @@
 import os
 
+from jina.clients.python import PyClient
 from jina.executors import BaseExecutor
 from jina.executors.indexers.keyvalue import BinaryPbIndexer
 from jina.executors.indexers.vector import NumpyIndexer
@@ -20,8 +21,13 @@ def test_incremental_indexing_sequential_indexers(random_workspace):
          .add(uses=os.path.join(cur_dir, 'uniq_vectorindexer.yml'))
          .add(uses=os.path.join(cur_dir, 'uniq_docindexer.yml')))
 
+    PyClient.check_input(duplicate_docs[:10])
+    PyClient.check_input(duplicate_docs)
+
     with f:
         f.index(duplicate_docs[:10])
+
+    with f:
         f.index(duplicate_docs)
 
     with BaseExecutor.load(random_workspace / 'vec_idx.bin') as vector_indexer:
@@ -43,9 +49,11 @@ def test_incremental_indexing_parallel_indexers(random_workspace):
          .add(uses=os.path.join(cur_dir, 'uniq_docindexer.yml'),
               name='inc_doc',
               needs=['gateway'])
-         .add(uses='_merge', needs=['inc_vec', 'inc_doc']))
+         .add(needs=['inc_vec', 'inc_doc']))
     with f:
         f.index(duplicate_docs[:500])
+
+    with f:
         f.index(duplicate_docs)
 
     with BaseExecutor.load((random_workspace / 'vec_idx.bin')) as vector_indexer:
@@ -62,18 +70,21 @@ def test_incremental_indexing_sequential_indexers_with_shards(random_workspace):
     duplicate_docs, num_uniq_docs = get_duplicate_docs(num_docs=total_docs)
 
     num_shards = 4
+    # can't use plain _unique in uses_before because workspace will conflict with other
     f = (Flow()
          .add(uses=os.path.join(cur_dir, 'vectorindexer.yml'),
-              uses_before='_unique',
+              uses_before=os.path.join(cur_dir, '_unique_vec.yml'),
               shards=num_shards,
               separated_workspace=True)
          .add(uses=os.path.join(cur_dir, 'docindexer.yml'),
-              uses_before='_unique',
+              uses_before=os.path.join(cur_dir, '_unique_doc.yml'),
               shards=num_shards,
               separated_workspace=True))
 
     with f:
         f.index(duplicate_docs[:500])
+
+    with f:
         f.index(duplicate_docs)
 
     vect_idx_size = 0
@@ -99,23 +110,26 @@ def test_incremental_indexing_parallel_indexers_with_shards(random_workspace):
 
     num_shards = 4
 
+    # can't use plain _unique in uses_before because workspace will conflict with other
     f = (Flow()
-         .add(uses=os.path.join(cur_dir, 'vectorindexer.yml'),
-              uses_before='_unique',
-              shards=num_shards,
-              name='inc_vec',
-              separated_workspace=True)
-         .add(uses=os.path.join(cur_dir, 'docindexer.yml'),
-              uses_before='_unique',
-              shards=num_shards,
-              name='inc_doc',
-              needs=['gateway'],
-              separated_workspace=True)
-         .add(uses='_merge',
-              needs=['inc_vec', 'inc_doc']))
+        .add(uses=os.path.join(cur_dir, 'vectorindexer.yml'),
+             uses_before=os.path.join(cur_dir, '_unique_vec.yml'),
+             shards=num_shards,
+             name='inc_vec',
+             separated_workspace=True)
+        .add(uses=os.path.join(cur_dir, 'docindexer.yml'),
+             uses_before=os.path.join(cur_dir, '_unique_doc.yml'),
+             shards=num_shards,
+             name='inc_doc',
+             needs=['gateway'],
+             separated_workspace=True)
+        .add(
+        needs=['inc_vec', 'inc_doc']))
 
     with f:
         f.index(duplicate_docs[:500])
+
+    with f:
         f.index(duplicate_docs)
 
     vect_idx_size = 0

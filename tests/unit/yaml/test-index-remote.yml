@@ -1,0 +1,19 @@
+!NumpyIndexer
+with:
+  metric: euclidean
+  index_filename: tmp2
+metas:
+  name: test2
+  workspace: $JINA_TEST_INDEX_REMOTE
+requests:
+  on:
+    SearchRequest:
+      - !VectorSearchDriver
+        with:
+          method: query
+    IndexRequest:
+      - !VectorIndexDriver
+        with:
+          method: add
+    ControlRequest:
+      - !ControlReqDriver {}

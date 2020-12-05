@@ -4,22 +4,22 @@ import requests
 from jina.clients import py_client
 from jina.clients.python import PyClient
 from jina.clients.python.io import input_files
-from jina.enums import ClientMode
+from jina.enums import RequestType
 from jina.flow import Flow
 from jina.helper import random_port
 from jina.parser import set_gateway_parser
 from jina.peapods.gateway import RESTGatewayPea
-from jina.proto.jina_pb2 import Document
+from jina.proto.jina_pb2 import DocumentProto
 
 
 @pytest.fixture(scope='function')
 def flow():
-    return Flow(rest_api=False).add(uses='_pass')
+    return Flow(rest_api=False).add()
 
 
 @pytest.fixture(scope='function')
 def flow_with_rest_api_enabled():
-    return Flow(rest_api=True).add(uses='_pass')
+    return Flow(rest_api=True).add()
 
 
 @pytest.fixture(scope='function')
@@ -35,16 +35,16 @@ def test_img_2():
 def test_client(flow):
     with flow:
         py_client(port_expose=flow.port_expose).call_unary(
-            b'a1234', mode=ClientMode.INDEX
+            [b'a1234', b'b4567'], mode=RequestType.INDEX,
         )
 
 
-@pytest.mark.parametrize('input_fn', [iter([b'1234', b'45467']), iter([Document(), Document()])])
+@pytest.mark.parametrize('input_fn', [iter([b'1234', b'45467']), iter([DocumentProto(), DocumentProto()])])
 def test_check_input_success(input_fn):
     PyClient.check_input(input_fn)
 
 
-@pytest.mark.parametrize('input_fn', [iter([b'1234', '45467', [12, 2, 3]]), iter([Document(), None])])
+@pytest.mark.parametrize('input_fn', [iter([list(), list(), [12, 2, 3]]), iter([set(), set()])])
 def test_check_input_fail(input_fn):
     with pytest.raises(TypeError):
         PyClient.check_input(input_fn)
