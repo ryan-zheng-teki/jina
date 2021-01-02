@@ -7,6 +7,7 @@ from jina.executors.evaluators.rank.precision import PrecisionEvaluator
 @pytest.mark.parametrize(
     'eval_at, expected',
     [
+        (None, 0.4),
         (0, 0.0),
         (2, 1.0),
         (4, 0.5),
@@ -27,6 +28,7 @@ def test_precision_evaluator(eval_at, expected):
 @pytest.mark.parametrize(
     'eval_at, expected_first',
     [
+        (None, 0.4),
         (0, 0.0),
         (2, 1.0),
         (4, 0.5),

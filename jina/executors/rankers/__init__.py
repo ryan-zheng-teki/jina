@@ -1,7 +1,7 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 
@@ -32,8 +32,11 @@ class Chunk2DocRanker(BaseRanker):
 
     required_keys = {'text'}  #: a set of ``str``, key-values to extracted from the chunk-level protobuf message
     COL_MATCH_PARENT_HASH = 'match_parent_hash'
+    COL_MATCH_PARENT_ID = 'match_parent_hash'
     COL_MATCH_HASH = 'match_hash'
+    COL_MATCH_ID = 'match_hash'
     COL_DOC_CHUNK_HASH = 'doc_chunk_hash'
+    COL_DOC_CHUNK_ID = 'doc_chunk_hash'
     COL_SCORE = 'score'
 
     def score(self, match_idx: 'np.ndarray', query_chunk_meta: Dict, match_chunk_meta: Dict) -> 'np.ndarray':
@@ -88,7 +91,7 @@ class Chunk2DocRanker(BaseRanker):
         r = np.array(r, dtype=[
             (Chunk2DocRanker.COL_MATCH_PARENT_HASH, np.int64),
             (Chunk2DocRanker.COL_SCORE, np.float64)]
-        )
+                     )
         return np.sort(r, order=Chunk2DocRanker.COL_SCORE)[::-1]
 
     def get_doc_id(self, match_with_same_doc_id):
@@ -106,6 +109,7 @@ class Match2DocRanker(BaseRanker):
     """
 
     COL_MATCH_HASH = 'match_hash'
+    COL_MATCH_ID = 'match_hash'
     COL_SCORE = 'score'
 
     def score(self, query_meta: Dict, old_match_scores: Dict, match_meta: Dict) -> 'np.ndarray':

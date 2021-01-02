@@ -156,7 +156,11 @@ class BaseIndexer(BaseExecutor):
 
     def flush(self):
         """Flush all buffered data to ``index_abspath`` """
-        call_obj_fn(self.write_handler, 'flush')
+        try:
+            # It may have already been closed by the Pea using context manager
+            call_obj_fn(self.write_handler, 'flush')
+        except:
+            pass
 
 
 class BaseVectorIndexer(BaseIndexer):
@@ -195,6 +199,12 @@ class BaseVectorIndexer(BaseIndexer):
         """
         raise NotImplementedError
 
+    def update(self, keys: Iterator[int], values: Iterator[bytes], *args, **kwargs):
+        raise NotImplementedError
+
+    def delete(self, keys: Iterator[int], *args, **kwargs):
+        raise NotImplementedError
+
 
 class BaseKVIndexer(BaseIndexer):
     """An abstract class for key-value indexer.
@@ -213,6 +223,12 @@ class BaseKVIndexer(BaseIndexer):
         :param key: ``id``
         :return: protobuf chunk or protobuf document
         """
+        raise NotImplementedError
+
+    def update(self, keys: Iterator[int], values: Iterator[bytes], *args, **kwargs):
+        raise NotImplementedError
+
+    def delete(self, keys: Iterator[int], *args, **kwargs):
         raise NotImplementedError
 
     def __getitem__(self, key: Any) -> Optional[Any]:
@@ -248,16 +264,16 @@ class CompoundIndexer(CompoundExecutor):
               index_filename: vec.gz
             metas:
               name: vecidx  # a customized name
-              workspace: $TEST_WORKDIR
+              workspace: ${{TEST_WORKDIR}}
           - !BinaryPbIndexer
             with:
               index_filename: chunk.gz
             metas:
               name: chunkidx  # a customized name
-              workspace: $TEST_WORKDIR
+              workspace: ${{TEST_WORKDIR}}
         metas:
           name: chunk_compound_indexer
-          workspace: $TEST_WORKDIR
+          workspace: ${{TEST_WORKDIR}}
 
     Without defining any ``requests.on`` logic. When load from this YAML, it will be auto equipped with
 

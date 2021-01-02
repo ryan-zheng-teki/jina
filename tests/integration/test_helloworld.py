@@ -5,11 +5,10 @@ from pathlib import Path
 import pytest
 from pkg_resources import resource_filename
 
-from jina.clients import py_client
-from jina.clients.python.io import input_numpy
+from jina.clients.sugary_io import _input_ndarray
 from jina.flow import Flow
 from jina.helloworld import download_data
-from jina.parser import set_hw_parser
+from jina.parsers.helloworld import set_hw_parser
 
 
 @pytest.mark.timeout(360)
@@ -27,12 +26,11 @@ def test_helloworld_execution(tmpdir):
         assert proc.returncode == 0, 'Script exited with non-zero code'
     # is_hello_world_in_stdout  = True
     assert is_hello_world_in_stdout, 'No cli = hello-world in stdoutput,' \
-                           'probably hello-world wasnt executed'
+                                     'probably hello-world wasnt executed'
 
 
 @pytest.mark.timeout(360)
 def test_helloworld_py(tmpdir):
-    from jina.parser import set_hw_parser
     from jina.helloworld import hello_world
     hello_world(set_hw_parser().parse_args(['--workdir', str(tmpdir)]))
 
@@ -66,9 +64,7 @@ def test_helloworld_flow(tmpdir):
 
     # run it!
     with f:
-        py_client(host=f.host,
-                  port_expose=f.port_expose,
-                  ).index(input_numpy(targets['index']['data']), batch_size=args.index_batch_size)
+        f.index(_input_ndarray(targets['index']['data']), batch_size=args.index_batch_size)
 
 
 def test_helloworld_flow_dry_run(tmpdir):

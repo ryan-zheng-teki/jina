@@ -7,8 +7,8 @@ from jina.drivers import BaseDriver
 from jina.drivers.control import ControlReqDriver
 from jina.drivers.search import KVSearchDriver
 from jina.executors import BaseExecutor
-from jina.helper import yaml
-from jina.parser import set_pod_parser
+from jina.jaml import JAML
+from jina.parsers import set_pod_parser
 from jina.peapods import Pod
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,17 +16,17 @@ cur_dir = os.path.dirname(os.path.abspath(__file__))
 
 def test_load_yaml1(tmpdir):
     with open(os.path.join(cur_dir, 'yaml/test-driver.yml'), encoding='utf8') as fp:
-        a = yaml.load(fp)
+        a = JAML.load(fp)
 
     assert isinstance(a[0], KVSearchDriver)
     assert isinstance(a[1], ControlReqDriver)
     assert isinstance(a[2], BaseDriver)
 
     with open(os.path.join(tmpdir, 'test_driver.yml'), 'w', encoding='utf8') as fp:
-        yaml.dump(a[0], fp)
+        JAML.dump(a[0], fp)
 
     with open(os.path.join(tmpdir, 'test_driver.yml'), encoding='utf8') as fp:
-        b = yaml.load(fp)
+        b = JAML.load(fp)
 
     assert isinstance(b, KVSearchDriver)
     assert b._executor_name == a[0]._executor_name
@@ -45,7 +45,8 @@ def test_pod_new_api_from_kwargs():
     a = BaseExecutor.load_config(os.path.join(cur_dir, 'mwu-encoder/mwu_encoder_driver.yml'))
     assert a._drivers['ControlRequest'][0].__class__.__name__ == 'MyAwesomeDriver'
 
-    with Pod(uses=os.path.join(cur_dir, 'mwu-encoder/mwu_encoder_driver.yml')):
+    args = set_pod_parser().parse_args(['--uses', os.path.join(cur_dir, 'mwu-encoder/mwu_encoder_driver.yml')])
+    with Pod(args):
         # will print a cust task_name from the driver when terminate
         pass
 

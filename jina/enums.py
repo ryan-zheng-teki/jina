@@ -23,7 +23,7 @@ To use these enums in YAML config, following the example below:
 
       chunk_idx:
         uses: index/chunk.yml
-        parallel: $PARALLEL
+        parallel: ${{PARALLEL}}
         separated_workspace: true
         parallel_type: !PollingType ANY
         # or
@@ -50,8 +50,8 @@ class EnumType(EnumMeta):
         if cls.__name__ not in reg_cls_set or getattr(cls, 'force_register', False):
             reg_cls_set.add(cls.__name__)
             setattr(cls, '_registered_class', reg_cls_set)
-        from .helper import yaml
-        yaml.register_class(cls)
+        from .jaml import JAML
+        JAML.register(cls)
         return cls
 
 
@@ -68,13 +68,23 @@ class BetterEnum(IntEnum, metaclass=EnumType):
             raise ValueError(f'{s.upper()} is not a valid enum for {cls}')
 
     @classmethod
-    def to_yaml(cls, representer, data):
-        """Required by :mod:`ruamel.yaml.constructor` """
+    def _to_yaml(cls, representer, data):
+        """Required by :mod:`pyyaml`
+
+        .. note::
+            In principle, this should inherit from :class:`JAMLCompatible` directly,
+            however, this method is too simple and thus replaced the parent method.
+        """
         return representer.represent_scalar('!' + cls.__name__, str(data))
 
     @classmethod
-    def from_yaml(cls, constructor, node):
-        """Required by :mod:`ruamel.yaml.constructor` """
+    def _from_yaml(cls, constructor, node):
+        """Required by :mod:`pyyaml`
+
+        .. note::
+            In principle, this should inherit from :class:`JAMLCompatible` directly,
+            however, this method is too simple and thus replaced the parent method.
+        """
         return cls.from_string(node.value)
 
 
@@ -238,8 +248,10 @@ class RequestType(BetterEnum):
     """
     INDEX = 0
     SEARCH = 1
-    TRAIN = 2
-    CONTROL = 3
+    DELETE = 2
+    UPDATE = 3
+    CONTROL = 4
+    TRAIN = 5
 
 
 class CompressAlgo(BetterEnum):
@@ -292,20 +304,18 @@ class FlowInspectType(BetterEnum):
         return self.value in {0, 2}
 
 
-class CallbackOnType(BetterEnum):
-    """Apply the callback_fn on which field of the request """
-
-    REQUEST = 0  # the full request object
-    BODY = 1  # the body of the request, `status`, `routes` and `queryset` are removed
-    DOCS = 2  # the documents inside the request body
-    GROUNDTRUTHS = 3  # the groundtruths inside the request body
-
-
 class RemoteAccessType(BetterEnum):
     """Remote access type when connect to the host """
 
     SSH = 0  # ssh connection
     JINAD = 1  # using rest api via jinad
+
+
+class RemotePeapodType(BetterEnum):
+    """Remote access type when connect to the host """
+
+    PEA = 0
+    POD = 1
 
 
 class BuildTestLevel(BetterEnum):
@@ -324,3 +334,8 @@ class DataInputType(BetterEnum):
     AUTO = 0  # auto inference the input type from data (!WARN: could be slow as it relies on try-execept)
     DOCUMENT = 1  # the input is a full document
     CONTENT = 2  # the input is just the content of the document
+
+
+class RuntimeBackendType(BetterEnum):
+    THREAD = 0
+    PROCESS = 1

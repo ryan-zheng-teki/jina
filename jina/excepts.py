@@ -20,7 +20,7 @@ class ExecutorFailToLoad(SystemError):
     """When the executor can not be loaded in pea/pod"""
 
 
-class PeaFailToStart(SystemError):
+class RuntimeFailToStart(SystemError):
     """When pea/pod is failed to started"""
 
 
@@ -32,7 +32,7 @@ class DriverError(Exception):
     """Driver related exceptions"""
 
 
-class RequestLoopEnd(KeyboardInterrupt):
+class RuntimeTerminated(KeyboardInterrupt):
     """The event loop of BasePea ends"""
 
 
@@ -76,6 +76,10 @@ class EmptyExecutorYAML(Exception):
     """The yaml config file is empty, nothing to read from there."""
 
 
+class BadConfigSource(FileNotFoundError):
+    """The yaml config file is bad, not loadable or not exist"""
+
+
 class BadWorkspace(Exception):
     """Can not determine the separate storage strategy for the executor"""
 
@@ -88,7 +92,7 @@ class BadClientCallback(BadClient):
     """Error in the callback function on the client side"""
 
 
-class BadClientRequestGenerator(BadClient):
+class BadClientInput(BadClient):
     """Error in the request generator function on the client side"""
 
 
@@ -167,9 +171,33 @@ class BadRequestType(TypeError):
     """Exception when can not construct a request object from given data"""
 
 
+class BadNamedScoreType(TypeError):
+    """ Exception when can not construct a named score from the given data """
+
+
 class RemotePodClosed(Exception):
     """ Exception when remote pod is closed and log streaming needs to exit """
 
 
 class LengthMismatchException(Exception):
     """ Exception when length of two items should be identical while not """
+
+
+class ImageAlreadyExists(Exception):
+    """ Exception when an image with the name, module version, and Jina version already exists on the Hub"""
+
+
+class BadFlowYAMLVersion(Exception):
+    """ Exception when Flow YAML config specifies a wrong version number"""
+
+
+class LookupyError(Exception):
+    """Base exception class for all exceptions raised by lookupy"""
+
+
+class EventLoopError(Exception):
+    """ Exception when a running event loop is found but not under jupyter or ipython """
+
+
+class ZMQSocketError(Exception):
+    """Exeception when ZMQlet/ZMQStreamlet can not be initialized """

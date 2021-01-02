@@ -55,12 +55,12 @@ def ground_truth_pairs():
 def test_encoding_evaluate_driver(mock_diff_evaluator,
                                   simple_evaluate_driver,
                                   ground_truth_pairs):
-    simple_evaluate_driver.attach(executor=mock_diff_evaluator, pea=None)
+    simple_evaluate_driver.attach(executor=mock_diff_evaluator, runtime=None)
     simple_evaluate_driver._apply_all(ground_truth_pairs)
     for pair in ground_truth_pairs:
         doc = pair.doc
         assert len(doc.evaluations) == 1
-        assert doc.evaluations[0].op_name == 'SimpleEvaluateDriver-MockDiffEvaluator'
+        assert doc.evaluations[0].op_name == 'MockDiffEvaluator'
         assert doc.evaluations[0].value == 1.0
 
 
@@ -97,8 +97,6 @@ def eval_request():
     for idx in range(num_docs):
         doc = Document(req.index.docs.add())
         gt = Document(req.index.groundtruths.add())
-        doc.update_id()
-        gt.update_id()
         chunk_doc = doc.chunks.new()
         chunk_gt = gt.chunks.new()
         chunk_doc.embedding = np.array([1, 1])
@@ -111,7 +109,7 @@ def test_encoding_evaluate_driver_embedding_in_chunks(simple_chunk_evaluate_driv
                                                       eval_request):
     # this test proves that we can evaluate matches at chunk level,
     # proving that the driver can traverse in a parallel way docs and groundtruth
-    simple_chunk_evaluate_driver.attach(executor=mock_diff_evaluator, pea=None)
+    simple_chunk_evaluate_driver.attach(executor=mock_diff_evaluator, runtime=None)
     simple_chunk_evaluate_driver.eval_request = eval_request
     simple_chunk_evaluate_driver()
 
@@ -125,5 +123,5 @@ def test_encoding_evaluate_driver_embedding_in_chunks(simple_chunk_evaluate_driv
         assert len(dc) == 1
         chunk = dc[0]
         assert len(chunk.evaluations) == 1  # evaluation done at chunk level
-        assert chunk.evaluations[0].op_name == 'SimpleChunkEvaluateDriver-MockDiffEvaluator'
+        assert chunk.evaluations[0].op_name == 'MockDiffEvaluator'
         assert chunk.evaluations[0].value == 1.0

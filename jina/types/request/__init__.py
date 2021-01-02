@@ -1,6 +1,7 @@
 from typing import Union, Optional, TypeVar, Dict
 
 from google.protobuf import json_format
+from google.protobuf.json_format import MessageToJson
 
 from ..sets import QueryLangSet, DocumentSet
 from ...enums import CompressAlgo, RequestType
@@ -18,7 +19,7 @@ _trigger_body_fields = set(kk
 _trigger_req_fields = set(jina_pb2.RequestProto.DESCRIPTOR.fields_by_name.keys()).difference(_body_type)
 _trigger_fields = _trigger_req_fields.union(_trigger_body_fields)
 
-__all__ = ['Request']
+__all__ = ['Request', 'Response']
 
 RequestSourceType = TypeVar('RequestSourceType',
                             jina_pb2.RequestProto, bytes, str, Dict)
@@ -39,7 +40,7 @@ class Request:
 
     """
 
-    def __init__(self, request: Union[bytes, 'jina_pb2.RequestProto', None] = None,
+    def __init__(self, request: Union[bytes, dict, str, 'jina_pb2.RequestProto', None] = None,
                  envelope: Optional['jina_pb2.EnvelopeProto'] = None,
                  copy: bool = False):
 
@@ -150,7 +151,7 @@ class Request:
         else:
             # if not then build one from buffer
             r = jina_pb2.RequestProto()
-            _buffer = self._decompress(self._buffer, self._envelope.compression.algorithm)
+            _buffer = self._decompress(self._buffer, self._envelope.compression.algorithm if self._envelope else None)
             r.ParseFromString(_buffer)
             self.is_used = True
             self._request = r
@@ -179,3 +180,21 @@ class Request:
     def command(self) -> str:
         self.is_used = True
         return jina_pb2.RequestProto.ControlRequestProto.Command.Name(self.as_pb_object.control.command)
+
+    def to_json(self) -> str:
+        """Return the object in JSON string """
+        return MessageToJson(self._request)
+
+    def to_response(self) -> 'Response':
+        """Return a weak reference of this object but as :class:`Response` object. It gives a more
+        consistent semantics on the client.
+        """
+        return Response(self._buffer)
+
+
+class Response(Request):
+    """Response is the :class:`Request` object returns from the flow. Right now it shares the same representation as
+    :class:`Request`. At 0.8.12, :class:`Response` is a simple alias. But it does give a more consistent semantic on
+    the client API: send a :class:`Request` and receive a :class:`Response`.
+
+    """

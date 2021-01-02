@@ -3,10 +3,9 @@ from typing import Dict, List
 import numpy as np
 import pytest
 
+from jina import Document
 from jina.drivers.craft import SegmentDriver
 from jina.executors.crafters import BaseSegmenter
-from jina import Document
-from jina.types.document import uid
 from jina.types.sets import DocumentSet
 
 
@@ -34,14 +33,13 @@ class SimpleSegmentDriver(SegmentDriver):
 
 def test_segment_driver():
     valid_doc = Document()
-    valid_doc.update_id()
     valid_doc.text = 'valid'
     valid_doc.length = 2
     valid_doc.mime_type = 'image/png'
 
     driver = SimpleSegmentDriver()
     executor = MockSegmenter()
-    driver.attach(executor=executor, pea=None)
+    driver.attach(executor=executor, runtime=None)
     driver._apply_all(DocumentSet([valid_doc]))
 
     assert valid_doc.length == 2
@@ -71,11 +69,10 @@ def test_segment_driver():
 def test_broken_document():
     driver = SimpleSegmentDriver()
     executor = MockSegmenter()
-    driver.attach(executor=executor, pea=None)
+    driver.attach(executor=executor, runtime=None)
 
     invalid_doc = Document()
-    invalid_doc.update_id()
-    invalid_doc.id = uid.new_doc_id(invalid_doc)
+    invalid_doc.id = 1
     invalid_doc.text = 'invalid'
     invalid_doc.length = 2
 

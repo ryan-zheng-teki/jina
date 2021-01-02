@@ -13,9 +13,10 @@ from jina.types.ndarray.generic import NdArray
 @pytest.fixture
 def config(tmpdir):
     os.environ['JINA_TOPK_DIR'] = str(tmpdir)
-    os.environ['JINA_NDOCS'] = '3'
     os.environ['JINA_TOPK'] = '9'
-    os.environ['JINA_TOPK_OVERRIDE'] = '11'
+    yield
+    del os.environ['JINA_TOPK_DIR']
+    del os.environ['JINA_TOPK']
 
 
 def random_docs(num_docs, embed_dim=10, jitter=1):
@@ -27,32 +28,47 @@ def random_docs(num_docs, embed_dim=10, jitter=1):
         yield d
 
 
-def validate_results(resp):
-    assert len(resp.search.docs) == int(os.environ['JINA_NDOCS'])
-    for doc in resp.search.docs:
-        assert len(doc.matches) == int(os.environ['JINA_TOPK'])
+def test_topk(config, mocker):
+    NDOCS = 3
+    TOPK = int(os.getenv('JINA_TOPK'))
 
+    def validate(resp):
+        mock()
+        assert len(resp.search.docs) == NDOCS
+        for doc in resp.search.docs:
+            assert len(doc.matches) == TOPK
 
-def test_topk(config):
     with Flow.load_config('flow.yml') as index_flow:
         index_flow.index(input_fn=random_docs(100))
+
+    mock = mocker.Mock()
     with Flow.load_config('flow.yml') as search_flow:
-        search_flow.search(input_fn=random_docs(int(os.environ['JINA_NDOCS'])),
-                           output_fn=validate_results)
+        search_flow.search(input_fn=random_docs(NDOCS),
+                           on_done=validate)
+
+    mock.assert_called_once()
 
 
-def validate_override_results(resp):
-    assert len(resp.search.docs) == int(os.environ['JINA_NDOCS'])
-    for doc in resp.search.docs:
-        assert len(doc.matches) == int(os.environ['JINA_TOPK_OVERRIDE'])
+def test_topk_override(config, mocker):
+    NDOCS = 3
+    TOPK_OVERRIDE = 11
+
+    def validate(resp):
+        mock()
+        assert len(resp.search.docs) == NDOCS
+        for doc in resp.search.docs:
+            assert len(doc.matches) == TOPK_OVERRIDE
 
 
-def test_topk_override(config):
+
     # Making queryset
-    top_k_queryset = QueryLang(VectorSearchDriver(top_k=int(os.environ['JINA_TOPK_OVERRIDE']), priority=1))
+    top_k_queryset = QueryLang(VectorSearchDriver(top_k=TOPK_OVERRIDE, priority=1))
 
     with Flow.load_config('flow.yml') as index_flow:
         index_flow.index(input_fn=random_docs(100))
+
+    mock = mocker.Mock()
     with Flow.load_config('flow.yml') as search_flow:
-        search_flow.search(input_fn=random_docs(int(os.environ['JINA_NDOCS'])),
-                           output_fn=validate_override_results, queryset=[top_k_queryset])
+        search_flow.search(input_fn=random_docs(NDOCS),
+                           on_done=validate, queryset=[top_k_queryset])
+    mock.assert_called_once()

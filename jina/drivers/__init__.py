@@ -12,18 +12,18 @@ from typing import (
     Sequence,
 )
 
-import ruamel.yaml.constructor
 from google.protobuf.struct_pb2 import Struct
 
 from ..enums import SkipOnErrorType
 from ..executors import BaseExecutor
 from ..executors.compound import CompoundExecutor
 from ..executors.decorators import wrap_func
-from ..helper import yaml, convert_tuple_to_list
+from ..helper import convert_tuple_to_list
+from ..jaml import JAMLCompatible
 
 if False:
     # fix type-hint complain for sphinx and flake
-    from ..peapods.pea import BasePea
+    from ..peapods.runtimes.zmq.zed import ZEDRuntime
     from ..executors import AnyExecutor
     from ..logging.logger import JinaLogger
     from ..types.message import Message
@@ -71,8 +71,7 @@ def store_init_kwargs(func: Callable) -> Callable:
 
 
 class QuerySetReader:
-    """
-    :class:`QuerySetReader` allows a driver to read arguments from the protobuf message. This allows a
+    """:class:`QuerySetReader` allows a driver to read arguments from the protobuf message. This allows a
     driver to override its behavior based on the message it receives. Extremely useful in production, for example,
     get ``top_k`` results, doing pagination, filtering.
 
@@ -91,6 +90,9 @@ class QuerySetReader:
         - the ``disabled`` field in the proto should not be ``False``
         - the ``priority`` in the proto should be strictly greater than the driver's priority (by default is 0)
         - the field name must exist in proto's ``parameters``
+
+    .. warning::
+        For the sake of cooperative multiple inheritance, do NOT implement :meth:`__init__` for this class
 
     """
 
@@ -117,7 +119,7 @@ class QuerySetReader:
         raise AttributeError
 
 
-class DriverType(type):
+class DriverType(type(JAMLCompatible), type):
     def __new__(cls, *args, **kwargs):
         _cls = super().__new__(cls, *args, **kwargs)
         return cls.register_class(_cls)
@@ -131,17 +133,16 @@ class DriverType(type):
 
             reg_cls_set.add(cls.__name__)
             setattr(cls, '_registered_class', reg_cls_set)
-        yaml.register_class(cls)
         return cls
 
 
-class BaseDriver(metaclass=DriverType):
-    """A :class:`BaseDriver` is a logic unit above the :class:`jina.peapods.pea.BasePea`.
+class BaseDriver(JAMLCompatible, metaclass=DriverType):
+    """A :class:`BaseDriver` is a logic unit above the :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime`.
     It reads the protobuf message, extracts/modifies the required information and then return
-    the message back to :class:`jina.peapods.pea.BasePea`.
+    the message back to :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime`.
 
-    A :class:`BaseDriver` needs to be :attr:`attached` to a :class:`jina.peapods.pea.BasePea` before using. This is done by
-    :func:`attach`. Note that a deserialized :class:`BaseDriver` from file is always unattached.
+    A :class:`BaseDriver` needs to be :attr:`attached` to a :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime` before
+    using. This is done by :func:`attach`. Note that a deserialized :class:`BaseDriver` from file is always unattached.
 
     """
 
@@ -153,43 +154,44 @@ class BaseDriver(metaclass=DriverType):
         :param priority: the priority of its default arg values (hardcoded in Python). If the
              received ``QueryLang`` has a higher priority, it will override the hardcoded value
         """
-        self.attached = False  #: represent if this driver is attached to a :class:`jina.peapods.pea.BasePea` (& :class:`jina.executors.BaseExecutor`)
-        self.pea = None  # type: Optional['BasePea']
+        self.attached = False  # : represent if this driver is attached to a
+        # :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime` (& :class:`jina.executors.BaseExecutor`)
+        self.runtime = None  # type: Optional['ZEDRuntime']
         self._priority = priority
 
-    def attach(self, pea: 'BasePea', *args, **kwargs) -> None:
-        """Attach this driver to a :class:`jina.peapods.pea.BasePea`
+    def attach(self, runtime: 'ZEDRuntime', *args, **kwargs) -> None:
+        """Attach this driver to a :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime`
 
-        :param pea: the pea to be attached.
+        :param runtime: the pea to be attached.
         """
-        self.pea = pea
+        self.runtime = runtime
         self.attached = True
 
     @property
     def req(self) -> 'Request':
-        """Get the current (typed) request, shortcut to ``self.pea.request``"""
-        return self.pea.request
+        """Get the current (typed) request, shortcut to ``self.runtime.request``"""
+        return self.runtime.request
 
     @property
     def partial_reqs(self) -> Sequence['Request']:
         """The collected partial requests under the current ``request_id`` """
         if self.expect_parts > 1:
-            return self.pea.partial_requests
+            return self.runtime.partial_requests
         else:
             raise ValueError(
                 f'trying to access all partial requests, '
-                f'but {self.pea} has only one message'
+                f'but {self.runtime} has only one message'
             )
 
     @property
     def expect_parts(self) -> int:
         """The expected number of partial messages """
-        return self.pea.expect_parts
+        return self.runtime.expect_parts
 
     @property
     def msg(self) -> 'Message':
-        """Get the current request, shortcut to ``self.pea.message``"""
-        return self.pea.message
+        """Get the current request, shortcut to ``self.runtime.message``"""
+        return self.runtime.message
 
     @property
     def queryset(self) -> 'QueryLangSet':
@@ -200,8 +202,8 @@ class BaseDriver(metaclass=DriverType):
 
     @property
     def logger(self) -> 'JinaLogger':
-        """Shortcut to ``self.pea.logger``"""
-        return self.pea.logger
+        """Shortcut to ``self.runtime.logger``"""
+        return self.runtime.logger
 
     def __call__(self, *args, **kwargs) -> None:
         raise NotImplementedError
@@ -215,26 +217,6 @@ class BaseDriver(metaclass=DriverType):
             r['with'] = a
         return r
 
-    @classmethod
-    def to_yaml(cls, representer, data):
-        """Required by :mod:`ruamel.yaml.constructor` """
-        tmp = data._dump_instance_to_yaml(data)
-        return representer.represent_mapping('!' + cls.__name__, tmp)
-
-    @classmethod
-    def from_yaml(cls, constructor, node):
-        """Required by :mod:`ruamel.yaml.constructor` """
-        return cls._get_instance_from_yaml(constructor, node)
-
-    @classmethod
-    def _get_instance_from_yaml(cls, constructor, node):
-        data = ruamel.yaml.constructor.SafeConstructor.construct_mapping(
-            constructor, node, deep=True
-        )
-
-        obj = cls(**data.get('with', {}))
-        return obj
-
     def __eq__(self, other):
         return self.__class__ == other.__class__
 
@@ -242,8 +224,8 @@ class BaseDriver(metaclass=DriverType):
         """Do not save the BasePea, as it would be cross-referencing. In other words, a deserialized :class:`BaseDriver` from
         file is always unattached."""
         d = dict(self.__dict__)
-        if 'pea' in d:
-            del d['pea']
+        if 'runtime' in d:
+            del d['runtime']
         d['attached'] = False
         return d
 
@@ -314,11 +296,11 @@ class BaseRecursiveDriver(BaseDriver):
 
 
 class BaseExecutableDriver(BaseRecursiveDriver):
-    """A :class:`BaseExecutableDriver` is an intermediate logic unit between the :class:`jina.peapods.pea.BasePea` and :class:`jina.executors.BaseExecutor`
+    """A :class:`BaseExecutableDriver` is an intermediate logic unit between the :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime` and :class:`jina.executors.BaseExecutor`
     It reads the protobuf message, extracts/modifies the required information and then sends to the :class:`jina.executors.BaseExecutor`,
-    finally it returns the message back to :class:`jina.peapods.pea.BasePea`.
+    finally it returns the message back to :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime`.
 
-    A :class:`BaseExecutableDriver` needs to be :attr:`attached` to a :class:`jina.peapods.pea.BasePea` and :class:`jina.executors.BaseExecutor` before using.
+    A :class:`BaseExecutableDriver` needs to be :attr:`attached` to a :class:`jina.peapods.runtimes.zmq.zed.ZEDRuntime` and :class:`jina.executors.BaseExecutor` before using.
     This is done by :func:`attach`. Note that a deserialized :class:`BaseDriver` from file is always unattached.
     """
 
@@ -344,7 +326,7 @@ class BaseExecutableDriver(BaseRecursiveDriver):
         """the function of :func:`jina.executors.BaseExecutor` to call """
         if (
             not self.msg.is_error
-            or self.pea.args.skip_on_error < SkipOnErrorType.EXECUTOR
+            or self.runtime.args.skip_on_error < SkipOnErrorType.EXECUTOR
         ):
             return self._exec_fn
         else:

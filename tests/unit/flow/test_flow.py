@@ -1,43 +1,56 @@
 import os
 
+import numpy as np
 import pytest
 import requests
-import numpy as np
 
-from jina import JINA_GLOBAL
-from jina.checker import NetworkChecker
-from jina.enums import FlowOptimizeLevel, SocketType
+from jina import JINA_GLOBAL, Request, AsyncFlow
+from jina.enums import SocketType
+from jina.executors import BaseExecutor
 from jina.flow import Flow
-from jina.parser import set_pea_parser, set_ping_parser, set_flow_parser, set_pod_parser
-from jina.peapods.pea import BasePea
-from jina.peapods.pod import BasePod
 from jina.proto.jina_pb2 import DocumentProto
-from jina.types.request.common import IndexDryRunRequest
+from jina.types.request import Response
 from tests import random_docs, rm_files
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 
 
-def test_ping():
-    a1 = set_pea_parser().parse_args([])
-    a2 = set_ping_parser().parse_args(['0.0.0.0', str(a1.port_ctrl), '--print-response'])
-    a3 = set_ping_parser().parse_args(['0.0.0.1', str(a1.port_ctrl), '--timeout', '1000'])
-
-    with pytest.raises(SystemExit) as cm:
-        with BasePea(a1):
-            NetworkChecker(a2)
-
-    assert cm.value.code == 0
-
-    # test with bad addresss
-    with pytest.raises(SystemExit) as cm:
-        with BasePea(a1):
-            NetworkChecker(a3)
-
-    assert cm.value.code == 1
-
-
 def test_flow_with_jump():
+    def _validate(f):
+        node = f._pod_nodes['gateway']
+        assert node.head_args.socket_in == SocketType.PULL_CONNECT
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r1']
+        assert node.head_args.socket_in == SocketType.PULL_BIND
+        assert node.tail_args.socket_out == SocketType.PUB_BIND
+        node = f._pod_nodes['r2']
+        assert node.head_args.socket_in == SocketType.SUB_CONNECT
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r3']
+        assert node.head_args.socket_in == SocketType.SUB_CONNECT
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r4']
+        assert node.head_args.socket_in == SocketType.PULL_BIND
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r5']
+        assert node.head_args.socket_in == SocketType.PULL_BIND
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r6']
+        assert node.head_args.socket_in == SocketType.PULL_BIND
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r8']
+        assert node.head_args.socket_in == SocketType.PULL_BIND
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r9']
+        assert node.head_args.socket_in == SocketType.PULL_BIND
+        assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
+        node = f._pod_nodes['r10']
+        assert node.head_args.socket_in == SocketType.PULL_BIND
+        assert node.tail_args.socket_out == SocketType.PUSH_BIND
+        for name, node in f._pod_nodes.items():
+            assert node.peas_args['peas'][0] == node.head_args
+            assert node.peas_args['peas'][0] == node.tail_args
+
     f = (Flow().add(name='r1')
          .add(name='r2')
          .add(name='r3', needs='r1')
@@ -49,57 +62,13 @@ def test_flow_with_jump():
          .add(name='r10', needs=['r9', 'r8']))
 
     with f:
-        f.dry_run()
-
-    node = f._pod_nodes['gateway']
-    assert node.head_args.socket_in == SocketType.PULL_CONNECT
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r1']
-    assert node.head_args.socket_in == SocketType.PULL_BIND
-    assert node.tail_args.socket_out == SocketType.PUB_BIND
-
-    node = f._pod_nodes['r2']
-    assert node.head_args.socket_in == SocketType.SUB_CONNECT
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r3']
-    assert node.head_args.socket_in == SocketType.SUB_CONNECT
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r4']
-    assert node.head_args.socket_in == SocketType.PULL_BIND
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r5']
-    assert node.head_args.socket_in == SocketType.PULL_BIND
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r6']
-    assert node.head_args.socket_in == SocketType.PULL_BIND
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r8']
-    assert node.head_args.socket_in == SocketType.PULL_BIND
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r9']
-    assert node.head_args.socket_in == SocketType.PULL_BIND
-    assert node.tail_args.socket_out == SocketType.PUSH_CONNECT
-
-    node = f._pod_nodes['r10']
-    assert node.head_args.socket_in == SocketType.PULL_BIND
-    assert node.tail_args.socket_out == SocketType.PUSH_BIND
-
-    for name, node in f._pod_nodes.items():
-        assert node.peas_args['peas'][0] == node.head_args
-        assert node.peas_args['peas'][0] == node.tail_args
+        _validate(f)
 
     f.save_config('tmp.yml')
     Flow.load_config('tmp.yml')
 
-    with Flow.load_config('tmp.yml') as fl:
-        fl.dry_run()
+    with Flow.load_config('tmp.yml') as f:
+        _validate(f)
 
     rm_files(['tmp.yml'])
 
@@ -135,14 +104,6 @@ def test_simple_flow():
     for name, node in f._pod_nodes.items():
         assert node.peas_args['peas'][0] == node.head_args
         assert node.peas_args['peas'][0] == node.tail_args
-
-
-def test_load_flow_from_yaml():
-    with open(os.path.join(cur_dir, '../yaml/test-flow.yml')) as fp:
-        a = Flow.load_config(fp)
-        with open(os.path.join(cur_dir, '../yaml/swarm-out.yml'), 'w') as fp, a:
-            a.to_swarm_yaml(fp)
-        rm_files([os.path.join(cur_dir, '../yaml/swarm-out.yml')])
 
 
 def test_flow_identical():
@@ -197,40 +158,13 @@ def test_flow_identical():
     rm_files(['test2.yml'])
 
 
-def test_dryrun():
-    f = (Flow()
-         .add(name='dummyEncoder', uses=os.path.join(cur_dir, '../mwu-encoder/mwu_encoder.yml')))
-
-    with f:
-        f.dry_run()
-
-
-def test_pod_status():
-    args = set_pod_parser().parse_args(['--parallel', '3'])
-    with BasePod(args) as p:
-        assert len(p.status) == p.num_peas
-        for v in p.status:
-            assert v
-
-
 def test_flow_no_container():
+
     f = (Flow()
          .add(name='dummyEncoder', uses=os.path.join(cur_dir, '../mwu-encoder/mwu_encoder.yml')))
 
     with f:
         f.index(input_fn=random_docs(10))
-
-
-def test_flow_yaml_dump():
-    f = Flow(logserver_config=os.path.join(cur_dir, '../yaml/test-server-config.yml'),
-             optimize_level=FlowOptimizeLevel.IGNORE_GATEWAY,
-             no_gateway=True)
-    f.save_config('test1.yml')
-
-    fl = Flow.load_config('test1.yml')
-    assert f.args.logserver_config == fl.args.logserver_config
-    assert f.args.optimize_level == fl.args.optimize_level
-    rm_files(['test1.yml'])
 
 
 def test_flow_log_server():
@@ -269,7 +203,7 @@ def test_flow_log_server():
         assert a.status_code == 200
 
         # Check ready endpoint after shutdown, check if server stopped
-        with pytest.raises(requests.exceptions.ConnectionError):
+        with pytest.raises((requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout)):
             requests.get(
                 JINA_GLOBAL.logserver.address +
                 '/status/ready',
@@ -296,11 +230,6 @@ def test_py_client():
          .add(name='r8', needs='r6')
          .add(name='r9', needs='r5')
          .add(name='r10', needs=['r9', 'r8']))
-
-    with f:
-        f.dry_run()
-        from jina.clients import py_client
-        py_client(port_expose=f.port_expose, host=f.host).dry_run(IndexDryRunRequest())
 
     with f:
         node = f._pod_nodes['gateway']
@@ -370,8 +299,6 @@ def test_dry_run_with_two_pathways_diverging_at_gateway():
             assert node.peas_args['peas'][0] == node.head_args
             assert node.peas_args['peas'][0] == node.tail_args
 
-        f.dry_run()
-
 
 def test_dry_run_with_two_pathways_diverging_at_non_gateway():
     f = (Flow().add(name='r1')
@@ -399,7 +326,6 @@ def test_dry_run_with_two_pathways_diverging_at_non_gateway():
         for name, node in f._pod_nodes.items():
             assert node.peas_args['peas'][0] == node.head_args
             assert node.peas_args['peas'][0] == node.tail_args
-        f.dry_run()
 
 
 def test_refactor_num_part():
@@ -477,34 +403,42 @@ def test_refactor_num_part_2():
         f.index_lines(lines=['abbcs', 'efgh'])
 
 
-def test_index_text_files():
+def test_index_text_files(mocker):
     def validate(req):
+        assert len(req.docs) > 0
         for d in req.docs:
             assert d.text
+
+    response_mock = mocker.Mock(wrap=validate)
 
     f = (Flow(read_only=True).add(uses=os.path.join(cur_dir, '../yaml/datauriindex.yml'), timeout_ready=-1))
 
     with f:
-        f.index_files('*.py', output_fn=validate, callback_on='body')
+        f.index_files('*.py', on_done=response_mock, callback_on='body')
 
     rm_files(['doc.gzip'])
+    response_mock.assert_called()
 
 
-def test_flow_with_publish_driver():
+def test_flow_with_publish_driver(mocker):
+    def validate(req):
+        for d in req.docs:
+            assert d.embedding is not None
+
+    response_mock = mocker.Mock(wrap=validate)
+
     f = (Flow()
          .add(name='r2', uses='!OneHotTextEncoder')
          .add(name='r3', uses='!OneHotTextEncoder', needs='gateway')
          .join(needs=['r2', 'r3']))
 
-    def validate(req):
-        for d in req.docs:
-            assert d.embedding is not None
-
     with f:
-        f.index_lines(lines=['text_1', 'text_2'], output_fn=validate)
+        f.index_lines(lines=['text_1', 'text_2'], on_done=response_mock)
+
+    response_mock.assert_called()
 
 
-def test_flow_with_modalitys_simple():
+def test_flow_with_modalitys_simple(mocker):
     def validate(req):
         for d in req.index.docs:
             assert d.modality in ['mode1', 'mode2']
@@ -518,35 +452,23 @@ def test_flow_with_modalitys_simple():
         doc3.modality = 'mode1'
         return [doc1, doc2, doc3]
 
+    response_mock = mocker.Mock(wrap=validate)
+
     flow = Flow().add(name='chunk_seg', parallel=3). \
         add(name='encoder12', parallel=2,
             uses='- !FilterQL | {lookups: {modality__in: [mode1, mode2]}, traversal_paths: [c]}')
     with flow:
-        flow.index(input_fn=input_fn, output_fn=validate)
+        flow.index(input_fn=input_fn, on_done=response_mock)
 
-
-def test_load_flow_with_port():
-    f = Flow.load_config('yaml/test-flow-port.yml')
-    with f:
-        assert f.port_expose == 12345
-
-
-def test_load_flow_from_cli():
-    a = set_flow_parser().parse_args(['--uses', 'yaml/test-flow-port.yml'])
-    f = Flow.load_config(a.uses)
-    with f:
-        assert f.port_expose == 12345
+    response_mock.assert_called()
 
 
 def test_flow_arguments_priorities():
     f = Flow(port_expose=12345).add(name='test', port_expose=23456)
-    assert '23456' in f._pod_nodes['test'].cli_args
-    assert '12345' not in f._pod_nodes['test'].cli_args
+    assert f._pod_nodes['test'].args.port_expose == 23456
 
-
-def test_flow_default_argument_passing():
     f = Flow(port_expose=12345).add(name='test')
-    assert '12345' in f._pod_nodes['test'].cli_args
+    assert f._pod_nodes['test'].args.port_expose == 12345
 
 
 def test_flow_arbitrary_needs():
@@ -589,3 +511,55 @@ def test_flow_needs_all():
 
     with f:
         f.index_ndarray(np.random.random([10, 10]))
+
+
+def test_flow_with_pod_envs():
+    f = Flow.load_config('yaml/flow-with-envs.yml')
+
+    class EnvChecker1(BaseExecutor):
+        """Class used in Flow YAML"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # pea/pod-specific
+            assert os.environ['key1'] == 'value1'
+            assert os.environ['key2'] == 'value2'
+            # inherit from parent process
+            assert os.environ['key_parent'] == 'value3'
+
+    class EnvChecker2(BaseExecutor):
+        """Class used in Flow YAML"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # pea/pod-specific
+            assert 'key1' not in os.environ
+            assert 'key2' not in os.environ
+            # inherit from parent process
+            assert os.environ['key_parent'] == 'value3'
+
+    with f:
+        pass
+
+
+@pytest.mark.parametrize('return_results', [False, True])
+def test_return_results_sync_flow(return_results):
+    with Flow(return_results=return_results).add() as f:
+        r = f.index_ndarray(np.random.random([10, 2]))
+        if return_results:
+            assert isinstance(r, list)
+            assert isinstance(r[0], Response)
+        else:
+            assert r is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('return_results', [False, True])
+async def test_return_results_async_flow(return_results):
+    with AsyncFlow(return_results=return_results).add() as f:
+        r = await f.index_ndarray(np.random.random([10, 2]))
+        if return_results:
+            assert isinstance(r, list)
+            assert isinstance(r[0], Response)
+        else:
+            assert r is None

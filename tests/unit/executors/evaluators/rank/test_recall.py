@@ -7,6 +7,7 @@ from jina.executors.evaluators.rank.recall import RecallEvaluator
 @pytest.mark.parametrize(
     'eval_at, expected',
     [
+        (None, 0.4),
         (0, 0.0),
         (1, 0.2),
         (2, 0.4),
@@ -29,6 +30,7 @@ def test_recall_evaluator(eval_at, expected):
 @pytest.mark.parametrize(
     'eval_at, expected_first',
     [
+        (None, 0.4),
         (0, 0.0),
         (1, 0.2),
         (2, 0.4),

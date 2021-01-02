@@ -67,11 +67,13 @@ def random_workspace(tmpdir):
                           ('flow-index-gt-parallel.yml', 'flow-evaluate-from-file-parallel.yml'),
                           ('flow-index-gt-parallel.yml', 'flow-parallel-evaluate-from-file-parallel.yml')
                           ])
-def test_evaluation_from_file(random_workspace, index_groundtruth, evaluate_docs, index_yaml, search_yaml):
+def test_evaluation_from_file(random_workspace, index_groundtruth, evaluate_docs, index_yaml, search_yaml, mocker):
     with Flow.load_config(index_yaml) as index_gt_flow:
-        index_gt_flow.index(input_fn=index_groundtruth, override_doc_id=False)
+        index_gt_flow.index(input_fn=index_groundtruth, batch_size=10)
 
+    m = mocker.Mock()
     def validate_evaluation_response(resp):
+        m()
         assert len(resp.docs) == 97
         assert len(resp.groundtruths) == 97
         for doc in resp.docs:
@@ -84,7 +86,8 @@ def test_evaluation_from_file(random_workspace, index_groundtruth, evaluate_docs
     with Flow.load_config(search_yaml) as evaluate_flow:
         evaluate_flow.search(
             input_fn=evaluate_docs,
-            output_fn=validate_evaluation_response,
+            on_done=validate_evaluation_response,
             callback_on='body',
-            override_doc_id=False
         )
+
+    m.assert_called_once()

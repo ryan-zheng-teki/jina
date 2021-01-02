@@ -1,33 +1,105 @@
 __copyright__ = "Copyright (c) 2020 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-if False:
-    from .python import PyClient
+from . import request
+from .base import BaseClient, CallbackFnType, InputFnType
+from .helper import callback_exec
+from .request import GeneratorSourceType
+from ..enums import RequestType
+from ..helper import run_async, deprecated_alias
 
 
-def py_client(**kwargs) -> 'PyClient':
+class Client(BaseClient):
     """A simple Python client for connecting to the gateway.
-
-    For acceptable ``kwargs``, please refer to :command:`jina client --help`
-
-    Example, assuming a Flow is "standby" on 192.168.1.100, with port_expose at 55555.
-
-    .. highlight:: python
-    .. code-block:: python
-
-        from jina.clients import py_client
-
-        # to test connectivity
-        py_client(host='192.168.1.100', port_expose=55555).dry_run()
-
-        # to search
-        py_client(host='192.168.1.100', port_expose=55555).search(input_fn, output_fn)
-
-        # to index
-        py_client(host='192.168.1.100', port_expose=55555).index(input_fn, output_fn)
+    It manges the asyncio eventloop internally, so all interfaces are synchronous from the outside.
     """
-    from ..parser import set_client_cli_parser
-    from ..helper import get_parsed_args
-    from .python import PyClient
-    _, args, _ = get_parsed_args(kwargs, set_client_cli_parser(), 'Client')
-    return PyClient(args)
+
+    @deprecated_alias(buffer='input_fn', callback='on_done', output_fn='on_done')
+    def train(self, input_fn: InputFnType = None,
+              on_done: CallbackFnType = None,
+              on_error: CallbackFnType = None,
+              on_always: CallbackFnType = None,
+              **kwargs) -> None:
+        """
+
+        :param input_fn: the input function that generates the content
+        :param on_done: the function to be called when the :class:`Request` object is resolved.
+        :param on_error: the function to be called when the :class:`Request` object is rejected.
+        :param on_always: the function to be called when the :class:`Request` object is  is either resolved or rejected.
+        :param kwargs:
+        :return:
+        """
+        self.mode = RequestType.TRAIN
+        return run_async(self._get_results, input_fn, on_done, on_error, on_always, **kwargs)
+
+    @deprecated_alias(buffer='input_fn', callback='on_done', output_fn='on_done')
+    def search(self, input_fn: InputFnType = None,
+               on_done: CallbackFnType = None,
+               on_error: CallbackFnType = None,
+               on_always: CallbackFnType = None,
+               **kwargs) -> None:
+        """
+
+        :param input_fn: the input function that generates the content
+        :param on_done: the function to be called when the :class:`Request` object is resolved.
+        :param on_error: the function to be called when the :class:`Request` object is rejected.
+        :param on_always: the function to be called when the :class:`Request` object is  is either resolved or rejected.
+        :param kwargs:
+        :return:
+        """
+        self.mode = RequestType.SEARCH
+        return run_async(self._get_results, input_fn, on_done, on_error, on_always, **kwargs)
+
+    @deprecated_alias(buffer='input_fn', callback='on_done', output_fn='on_done')
+    def index(self, input_fn: InputFnType = None,
+              on_done: CallbackFnType = None,
+              on_error: CallbackFnType = None,
+              on_always: CallbackFnType = None,
+              **kwargs) -> None:
+        """
+
+        :param input_fn: the input function that generates the content
+        :param on_done: the function to be called when the :class:`Request` object is resolved.
+        :param on_error: the function to be called when the :class:`Request` object is rejected.
+        :param on_always: the function to be called when the :class:`Request` object is  is either resolved or rejected.
+        :param kwargs:
+        :return:
+        """
+        self.mode = RequestType.INDEX
+        return run_async(self._get_results, input_fn, on_done, on_error, on_always, **kwargs)
+
+    @deprecated_alias(buffer='input_fn', callback='on_done', output_fn='on_done')
+    def update(self, input_fn: InputFnType = None,
+              on_done: CallbackFnType = None,
+              on_error: CallbackFnType = None,
+              on_always: CallbackFnType = None,
+              **kwargs) -> None:
+        """
+
+        :param input_fn: the input function that generates the content
+        :param on_done: the function to be called when the :class:`Request` object is resolved.
+        :param on_error: the function to be called when the :class:`Request` object is rejected.
+        :param on_always: the function to be called when the :class:`Request` object is  is either resolved or rejected.
+        :param kwargs:
+        :return:
+        """
+        self.mode = RequestType.UPDATE
+        return run_async(self._get_results, input_fn, on_done, on_error, on_always, **kwargs)
+
+    @deprecated_alias(buffer='input_fn', callback='on_done', output_fn='on_done')
+    def delete(self, input_fn: InputFnType = None,
+              on_done: CallbackFnType = None,
+              on_error: CallbackFnType = None,
+              on_always: CallbackFnType = None,
+              **kwargs) -> None:
+        """
+
+        :param input_fn: the input function that generates the content
+        :param on_done: the function to be called when the :class:`Request` object is resolved.
+        :param on_error: the function to be called when the :class:`Request` object is rejected.
+        :param on_always: the function to be called when the :class:`Request` object is  is either resolved or rejected.
+        :param kwargs:
+        :return:
+        """
+        self.mode = RequestType.DELETE
+        return run_async(self._get_results, input_fn, on_done, on_error, on_always, **kwargs)

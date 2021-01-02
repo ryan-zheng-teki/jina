@@ -5,8 +5,11 @@ __license__ = "Apache-2.0"
 def pod(args):
     """Start a Pod"""
     from jina.peapods import Pod
-    with Pod(args) as p:
-        p.join()
+    try:
+        with Pod(args) as p:
+            p.join()
+    except KeyboardInterrupt:
+        pass
 
 
 def pea(args):
@@ -21,9 +24,7 @@ def pea(args):
 
 def gateway(args):
     """Start a Gateway Pod"""
-    from jina.peapods.pod import GatewayPod
-    with GatewayPod(args) as fs:
-        fs.join()
+    pod(args)
 
 
 def log(args):
@@ -45,8 +46,8 @@ def ping(args):
 
 def client(args):
     """Start a client connects to the gateway"""
-    from jina.clients.python import PyClient
-    PyClient(args)
+    from jina.clients import Client
+    Client(args)
 
 
 def export_api(args):
@@ -57,9 +58,9 @@ def export_api(args):
     if args.yaml_path:
         for yp in args.yaml_path:
             f_name = (yp % __version__) if '%s' in yp else yp
-            from jina.helper import yaml
+            from jina.jaml import JAML
             with open(f_name, 'w', encoding='utf8') as fp:
-                yaml.dump(api_to_dict(), fp)
+                JAML.dump(api_to_dict(), fp)
             default_logger.info(f'API is exported to {f_name}')
 
     if args.json_path:
@@ -92,4 +93,3 @@ def hub(args):
     """Start a hub builder for build, push, pull"""
     from jina.docker.hubio import HubIO
     getattr(HubIO(args), args.hub)()
-

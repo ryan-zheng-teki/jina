@@ -13,11 +13,11 @@ from pkg_resources import resource_filename
 
 from . import formatter
 from ..enums import LogVerbosity
-from ..helper import yaml, complete_path, typename
+from ..jaml import JAML
 
 
 class NTLogger:
-    def __init__(self, context: str, log_level: 'LogVerbosity'=LogVerbosity.INFO):
+    def __init__(self, context: str, log_level: 'LogVerbosity' = LogVerbosity.INFO):
         """A compatible logger for Windows system, colors are all removed to keep compat.
 
         :param context: the name prefix of each log
@@ -106,8 +106,6 @@ class JinaLogger:
             log_config = os.getenv('JINA_LOG_CONFIG',
                                    resource_filename('jina', '/'.join(
                                        ('resources', 'logging.default.yml'))))
-        log_config = complete_path(log_config)
-
         if log_id is None:
             log_id = os.getenv('JINA_LOG_ID', None)
 
@@ -158,7 +156,7 @@ class JinaLogger:
         self.logger.handlers = []
 
         with open(config_path) as fp:
-            config = yaml.load(fp)
+            config = JAML.load(fp)
 
         for h in config['handlers']:
             cfg = config['configs'].get(h, None)
